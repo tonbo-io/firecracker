@@ -2513,13 +2513,14 @@ mod tests {
 
             let hdr_desc = &vq.dtable[idx as usize];
             hdr_desc.addr.set(hdr_addr.0);
+            hdr_desc.len.set(16);
             hdr_desc.flags.set(VIRTQ_DESC_F_NEXT);
             hdr_desc.next.set(idx + 1);
 
             let status_desc = &vq.dtable[idx as usize + 1];
             status_desc.addr.set(status_addr.0);
             status_desc.flags.set(VIRTQ_DESC_F_WRITE);
-            status_desc.len.set(4);
+            status_desc.len.set(1);
             status_addr = status_addr.checked_add(4).unwrap();
 
             vq.avail.ring[i as usize].set(idx);

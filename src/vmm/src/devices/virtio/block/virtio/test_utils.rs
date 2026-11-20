@@ -215,7 +215,7 @@ pub fn read_blk_req_descriptors(vq: &VirtQueue) {
 
     // Set the request type descriptor.
     vq.avail.ring[request_type_desc as usize].set(request_type_desc);
-    vq.dtable[request_type_desc as usize].set(request_addr, len, VIRTQ_DESC_F_NEXT, data_desc);
+    vq.dtable[request_type_desc as usize].set(request_addr, 16, VIRTQ_DESC_F_NEXT, data_desc);
 
     // Set the data descriptor.
     vq.avail.ring[data_desc as usize].set(data_desc);
@@ -228,7 +228,7 @@ pub fn read_blk_req_descriptors(vq: &VirtQueue) {
 
     // Set the status descriptor.
     vq.avail.ring[status_desc as usize].set(status_desc);
-    vq.dtable[status_desc as usize].set(status_addr, len, VIRTQ_DESC_F_WRITE, status_desc + 1);
+    vq.dtable[status_desc as usize].set(status_addr, 1, VIRTQ_DESC_F_WRITE, status_desc + 1);
 
     // Mark the next available descriptor.
     vq.avail.idx.set(1);
