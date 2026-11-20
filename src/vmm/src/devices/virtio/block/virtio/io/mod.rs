@@ -997,4 +997,197 @@ pub mod tests {
             assert!(matches!(err.error, BlockIoError::VectoredLength(1024)));
         }
     }
+
+    // A multi-segment write then read, on both engines: the file gets the segments in order,
+    // the read puts them back in other scattered segments and marks exactly those dirty.
+    #[test]
+    fn test_vectored_read_write() {
+        const MEM: usize = 16 * 4096;
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let mem = create_mem_pages(16);
+            let file = TempFile::new().unwrap().into_file();
+            file.set_len(MEM as u64).unwrap();
+            let check = file.try_clone().unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+
+            // Three scattered source segments, odd lengths that add up to whole sectors.
+            let src: Vec<DataSegment> = vec![
+                (GuestAddress(0x3000), 4096),
+                (GuestAddress(0x1000), 100),
+                (GuestAddress(0x7010), 412),
+            ];
+            let mut expected = Vec::new();
+            for (i, &(addr, len)) in src.iter().enumerate() {
+                let bytes: Vec<u8> = (0..len)
+                    .map(|b| u8::try_from(b % 256).unwrap() ^ u8::try_from(i * 0x55).unwrap())
+                    .collect();
+                mem.write_slice(&bytes, addr).unwrap();
+                expected.extend(bytes);
+            }
+            let total = u32::try_from(expected.len()).unwrap();
+            let res = engine.writev(512, &mem, src, total, PendingRequest::default());
+            match engine_type {
+                FileEngineType::Sync => assert_sync_execution!(res, total),
+                FileEngineType::Async => {
+                    assert_queued!(res);
+                    assert_async_execution(&mem, &mut engine, total);
+                }
+            }
+            let mut on_disk = vec![0u8; expected.len()];
+            check.read_exact_at(&mut on_disk, 512).unwrap();
+            assert_eq!(on_disk, expected);
+
+            // Read back into two other segments, from a clean bitmap.
+            mem.reset_dirty();
+            let dst: Vec<DataSegment> = vec![
+                (GuestAddress(0xa000), 2048),
+                (GuestAddress(0xc000), total - 2048),
+            ];
+            let res = engine.readv(512, &mem, dst.clone(), total, PendingRequest::default());
+            match engine_type {
+                FileEngineType::Sync => assert_sync_execution!(res, total),
+                FileEngineType::Async => {
+                    assert_queued!(res);
+                    assert_async_execution(&mem, &mut engine, total);
+                }
+            }
+            let mut got = Vec::new();
+            for &(addr, len) in &dst {
+                let mut part = vec![0u8; len as usize];
+                mem.read_slice(&mut part, addr).unwrap();
+                got.extend(part);
+                check_dirty_mem(&mem, addr, len);
+            }
+            assert_eq!(got, expected);
+            check_clean_mem(&mem, GuestAddress(0x3000), 4096);
+
+            // A segment outside guest memory fails the request without touching the file.
+            let bad: Vec<DataSegment> =
+                vec![(GuestAddress(0), 512), (GuestAddress(MEM as u64), 512)];
+            engine
+                .writev(0, &mem, bad, 1024, PendingRequest::default())
+                .unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_async_full_cq_allows_continuation() {
+        use crate::devices::virtio::block::virtio::IO_URING_NUM_ENTRIES;
+        let mem = create_mem();
+        let file = TempFile::new().unwrap().into_file();
+        file.write_all_at(&[0x5a; 512], 0).unwrap();
+        let mut engine = AsyncFileEngine::from_file(file, false).unwrap();
+        // A read of two segments that the 512-byte file cuts short, then flushes until the
+        // ring holds as many operations as its completion queue has entries.
+        engine
+            .push_readv(
+                0,
+                &mem,
+                vec![(GuestAddress(0), 512), (GuestAddress(4096), 512)],
+                PendingRequest::default(),
+            )
+            .unwrap();
+        for batch in 0..2 {
+            let count = if batch == 0 {
+                IO_URING_NUM_ENTRIES - 1
+            } else {
+                IO_URING_NUM_ENTRIES
+            };
+            for _ in 0..count {
+                engine.push_flush(PendingRequest::default()).unwrap();
+            }
+            engine.kick_submission_queue().unwrap();
+        }
+        // The ring is full: the next request is pushed back, not lost.
+        let err = engine.push_flush(PendingRequest::default()).unwrap_err();
+        assert!(matches!(&err.error, AsyncIoError::IoUring(err) if err.is_throttling_err()));
+        let mut completed = 0;
+        let mut short_reads = 0;
+        while engine.has_pending_ops() {
+            engine.drain(false).unwrap();
+            while let Some(cqe) = engine.pop(&mem).unwrap() {
+                completed += 1;
+                // The read continued after its short completion, although the ring was full,
+                // and ended at the end of the file with the bytes it read.
+                if cqe.result().unwrap() == 512 {
+                    short_reads += 1;
+                }
+            }
+        }
+        assert_eq!(completed, u32::from(IO_URING_NUM_ENTRIES) * 2);
+        assert_eq!(short_reads, 1);
+    }
+
+    #[test]
+    fn test_async_short_read_continues_from_known_prefix() {
+        let mem = create_mem();
+        let file = TempFile::new().unwrap().into_file();
+        file.write_all_at(&[0x31; 512], 0).unwrap();
+        let mut engine = AsyncFileEngine::from_file(file, false).unwrap();
+        engine
+            .push_readv(
+                0,
+                &mem,
+                vec![(GuestAddress(0), 256), (GuestAddress(4096), 768)],
+                PendingRequest::default(),
+            )
+            .unwrap();
+        // Wait until the initial 1024-byte READV hits the old 512-byte EOF.
+        engine.kick_submission_queue().unwrap();
+        while engine.completion_evt().read().is_err() {
+            std::thread::yield_now();
+        }
+        // Extend before harvesting the CQE: the next child must start at byte 512.
+        engine.file().write_all_at(&[0x72; 512], 512).unwrap();
+        let cqe = loop {
+            if let Some(cqe) = engine.pop(&mem).unwrap() {
+                break cqe;
+            }
+            engine.drain(false).unwrap();
+        };
+        assert_eq!(cqe.result().unwrap(), 1024);
+        assert!(!engine.has_pending_ops());
+        let mut first = [0; 256];
+        let mut rest = [0; 768];
+        mem.read_slice(&mut first, GuestAddress(0)).unwrap();
+        mem.read_slice(&mut rest, GuestAddress(4096)).unwrap();
+        assert_eq!(first, [0x31; 256]);
+        assert_eq!(&rest[..256], &[0x31; 256]);
+        assert_eq!(&rest[256..], &[0x72; 512]);
+        check_dirty_mem(&mem, GuestAddress(0), 256);
+        check_dirty_mem(&mem, GuestAddress(4096), 768);
+    }
+
+    #[test]
+    fn test_async_short_read_then_eof_preserves_progress_and_dirty() {
+        let mem = create_mem();
+        let file = TempFile::new().unwrap().into_file();
+        file.write_all_at(&[0x5a; 512], 0).unwrap();
+        let mut engine = AsyncFileEngine::from_file(file, false).unwrap();
+        engine
+            .push_readv(
+                0,
+                &mem,
+                vec![(GuestAddress(0), 256), (GuestAddress(4096), 768)],
+                PendingRequest::default(),
+            )
+            .unwrap();
+        let cqe = loop {
+            engine.drain(false).unwrap();
+            if let Some(cqe) = engine.pop(&mem).unwrap() {
+                break cqe;
+            }
+        };
+        // Fewer bytes than the request has: the device fails it and reports them.
+        assert_eq!(cqe.result().unwrap(), 512);
+        assert!(!engine.has_pending_ops());
+        let mut first = [0; 256];
+        mem.read_slice(&mut first, GuestAddress(0)).unwrap();
+        assert_eq!(first, [0x5a; 256]);
+        let mut second = [0; 256];
+        mem.read_slice(&mut second, GuestAddress(4096)).unwrap();
+        assert_eq!(second, [0x5a; 256]);
+        check_dirty_mem(&mem, GuestAddress(0), 256);
+        check_dirty_mem(&mem, GuestAddress(4096), 768);
+    }
 }
