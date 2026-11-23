@@ -576,6 +576,11 @@ impl Request {
             if !req.data_len.is_multiple_of(SECTOR_SIZE) {
                 return Err(VirtioBlockError::InvalidDataLength);
             }
+            // More than one vectored transfer moves: refused here, before the rate limiter
+            // is charged for it.
+            if !req.segments.is_empty() && req.data_len > block_io::MAX_VECTORED_BYTES {
+                return Err(VirtioBlockError::InvalidDataLength);
+            }
             let top = req
                 .sector
                 .checked_add(u64::from(req.data_len) >> SECTOR_SHIFT)
@@ -673,6 +678,10 @@ impl Request {
     ) -> ProcessingResult {
         let pending = self.to_pending_request(desc_idx);
         let res = match self.r#type {
+            // A read or a write of no data has no buffer to resolve and nothing to transfer.
+            RequestType::In | RequestType::Out if self.data_len == 0 => {
+                return ProcessingResult::Executed(pending.finish(mem, Ok(0), block_metrics));
+            }
             RequestType::In if !self.segments.is_empty() => {
                 let _metric = block_metrics.read_agg.record_latency_metrics();
                 disk.file_engine
@@ -2053,6 +2062,99 @@ mod tests {
         // The last data descriptor points back at the first.
         vq.dtable[8].next.set(1);
         run_chain(&vq, &mut disk).unwrap_err();
+        assert!(disk_untouched(&backing));
+    }
+
+    // A request of several segments that ends exactly at the last sector is inside the disk.
+    #[test]
+    fn test_multi_segment_request_up_to_last_sector() {
+        use std::os::unix::fs::FileExt;
+
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        let segments = multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            HOSTILE_DISK_SECTORS - 3,
+            &[(512, false), (1024, false)],
+        );
+        mem.write_slice(&[0x44; 512], segments[0].0).unwrap();
+        mem.write_slice(&[0x55; 1024], segments[1].0).unwrap();
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+        assert_eq!(status_at(&mem, 0x20000), VIRTIO_BLK_S_OK);
+        let mut tail = [0u8; 1536];
+        let offset = (HOSTILE_DISK_SECTORS - 3) * 512;
+        backing.as_file().read_exact_at(&mut tail, offset).unwrap();
+        assert_eq!(&tail[..512], &[0x44; 512]);
+        assert_eq!(&tail[512..], &[0x55; 1024]);
+        assert_eq!(
+            backing.as_file().metadata().unwrap().len(),
+            HOSTILE_DISK_SECTORS * 512
+        );
+
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_IN,
+            HOSTILE_DISK_SECTORS - 3,
+            &[(512, true), (1024, true)],
+        );
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1537);
+    }
+
+    // A read or a write without data, in guest memory that does not start at address 0:
+    // completed without resolving a buffer, which it does not have.
+    #[test]
+    fn test_request_without_data() {
+        const BASE: u64 = 0x8000_0000;
+        let mem = crate::test_utils::single_region_mem_at(BASE, 0x10000);
+        let vq = VirtQueue::new(GuestAddress(BASE), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        for request_type in [VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT] {
+            mem.write_obj(
+                RequestHeader::new(request_type, 0),
+                GuestAddress(BASE + 0x1000),
+            )
+            .unwrap();
+            vq.dtable[0].set(BASE + 0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+            vq.dtable[1].set(BASE + 0x2000, 1, VIRTQ_DESC_F_WRITE, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+            mem.write_obj(0xffu8, GuestAddress(BASE + 0x2000)).unwrap();
+            assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+            assert_eq!(status_at(&mem, BASE + 0x2000), VIRTIO_BLK_S_OK);
+        }
+        assert!(disk_untouched(&backing));
+    }
+
+    // A write of several segments to a drive whose file is open read-only: an I/O error in
+    // the status, nothing written.
+    #[test]
+    fn test_multi_segment_write_to_read_only_drive() {
+        use std::os::unix::fs::FileExt;
+
+        use crate::devices::virtio::block::virtio::device::{DiskImageFormat, FileEngineType};
+
+        let backing = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let len = usize::try_from(HOSTILE_DISK_SECTORS).unwrap() * 512;
+        backing.as_file().write_all_at(&vec![0xdd; len], 0).unwrap();
+        let mut disk = DiskProperties::new(
+            backing.as_path().to_str().unwrap(),
+            true,
+            FileEngineType::Sync,
+            DiskImageFormat::Raw,
+            false,
+        )
+        .unwrap();
+
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        multi_chain(&vq, VIRTIO_BLK_T_OUT, 0, &[(512, false), (512, false)]);
+        mem.write_obj(0xffu8, GuestAddress(0x20000)).unwrap();
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+        assert_eq!(status_at(&mem, 0x20000), VIRTIO_BLK_S_IOERR);
         assert!(disk_untouched(&backing));
     }
 }

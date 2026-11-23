@@ -396,4 +396,49 @@ mod tests {
             }
         }
     }
+
+    // A device saved by a build without `VIRTIO_BLK_F_SEG_MAX` is restored without it: it
+    // offers one data segment per request, as its driver expects, and its config space says
+    // so. A device of this build keeps the feature across a save and a restore.
+    #[test]
+    fn test_restore_keeps_saved_segment_limit() {
+        use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_SEG_MAX;
+
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+        let seg_max_bit = 1u64 << VIRTIO_BLK_F_SEG_MAX;
+        let restore = |state: &VirtioBlockState| {
+            VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, state).unwrap()
+        };
+
+        let mut block = default_block_with_path(
+            f.as_path().to_str().unwrap().to_string(),
+            FileEngineType::Sync,
+        );
+        assert_ne!(block.avail_features() & seg_max_bit, 0);
+        assert_eq!(u32::from_le(block.config_space.seg_max), SEG_MAX);
+        block.acked_features = block.avail_features();
+        let restored = restore(&block.save());
+        assert_ne!(restored.avail_features() & seg_max_bit, 0);
+        assert_ne!(restored.acked_features() & seg_max_bit, 0);
+        assert_eq!(u32::from_le(restored.config_space.seg_max), SEG_MAX);
+
+        let mut old = block.save();
+        old.virtio_state.avail_features &= !seg_max_bit;
+        old.virtio_state.acked_features &= !seg_max_bit;
+        let restored = restore(&old);
+        assert_eq!(restored.avail_features() & seg_max_bit, 0);
+        assert_eq!(restored.acked_features() & seg_max_bit, 0);
+        assert_eq!(restored.config_space.seg_max, 0);
+    }
+
+    // A snapshot of this build is one that a VMM at format 13.0, which takes one data segment
+    // per request, refuses: same major, a minor above its own.
+    #[test]
+    fn test_snapshot_format_refused_before_segments() {
+        use crate::persist::SNAPSHOT_VERSION;
+
+        assert_eq!(SNAPSHOT_VERSION.major(), 13);
+        assert!(SNAPSHOT_VERSION.minor() > 0);
+    }
 }

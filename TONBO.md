@@ -56,6 +56,22 @@ Not in the stack yet: several data segments per virtio-blk request
 (`VIRTIO_BLK_F_SEG_MAX`), upstream issue
 [#6441](https://github.com/firecracker-microvm/firecracker/issues/6441).
 
+## Known base behaviours, not patched
+
+These are upstream's behaviours that the stack leaves as they are. They are
+listed so that nobody takes them for effects of a patch.
+
+- A virtio-blk request that the io_uring ring has no room for is put back on
+  the queue after the rate limiter was charged for it, and is charged again
+  when it is taken up later. The Sync engine never puts a request back.
+- `TokenBucket::reduce` moves the bucket's last-update time only when it
+  spends from the one-time burst. A reduction that the regular budget covers
+  leaves the time where the last refill put it.
+- The device does not hold a driver to the `seg_max` it advertises: a chain
+  of more data descriptors is served as long as the queue holds it. This one
+  is deliberate, and the same as for other limits a driver reads from the
+  config space.
+
 ## Checks
 
 `.github/workflows/tonbo.yml` runs on every push to `main` and to `wip/**`

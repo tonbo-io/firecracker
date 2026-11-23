@@ -1190,4 +1190,109 @@ pub mod tests {
         check_dirty_mem(&mem, GuestAddress(0), 256);
         check_dirty_mem(&mem, GuestAddress(4096), 768);
     }
+
+    // A read that came back short and whose continuation is in flight, or whose completion
+    // was not taken off the ring yet: a drain that drops completions waits for the kernel and
+    // leaves nothing behind.
+    #[test]
+    fn test_async_drain_drops_continuations() {
+        for harvest_first in [false, true] {
+            let mem = create_mem();
+            let file = TempFile::new().unwrap().into_file();
+            file.write_all_at(&[0x5a; 512], 0).unwrap();
+            let mut engine = AsyncFileEngine::from_file(file, false).unwrap();
+            engine
+                .push_readv(
+                    0,
+                    &mem,
+                    vec![(GuestAddress(0), 512), (GuestAddress(4096), 512)],
+                    PendingRequest::default(),
+                )
+                .unwrap();
+            engine.kick_submission_queue().unwrap();
+            while engine.completion_evt().read().is_err() {
+                std::thread::yield_now();
+            }
+            if harvest_first {
+                // The short completion is taken off the ring and its continuation issued.
+                assert!(engine.pop(&mem).unwrap().is_none());
+            }
+            assert!(engine.has_pending_ops());
+            engine.drain(true).unwrap();
+            assert!(!engine.has_pending_ops());
+            assert!(engine.pop(&mem).unwrap().is_none());
+        }
+    }
+
+    // More segments than one vectored call takes: both engines go on with the rest.
+    #[test]
+    fn test_vectored_more_iovecs_than_one_call() {
+        const SEGMENTS: usize = MAX_IOVECS + 76;
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let mem = create_mem();
+            mem.write_slice(&[0x6b; 512], GuestAddress(0)).unwrap();
+            let file = TempFile::new().unwrap().into_file();
+            let check = file.try_clone().unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+            // Every segment is the same sector of guest memory.
+            let segments = vec![(GuestAddress(0), 512); SEGMENTS];
+            let total = u32::try_from(SEGMENTS * 512).unwrap();
+
+            let res = engine.writev(0, &mem, segments.clone(), total, PendingRequest::default());
+            match engine_type {
+                FileEngineType::Sync => assert_sync_execution!(res, total),
+                FileEngineType::Async => {
+                    assert_queued!(res);
+                    assert_async_execution(&mem, &mut engine, total);
+                }
+            }
+            let mut on_disk = vec![0u8; SEGMENTS * 512];
+            check.read_exact_at(&mut on_disk, 0).unwrap();
+            assert_eq!(check.metadata().unwrap().len(), u64::from(total));
+            assert!(on_disk.iter().all(|&byte| byte == 0x6b));
+
+            mem.write_slice(&[0u8; 512], GuestAddress(0)).unwrap();
+            let res = engine.readv(0, &mem, segments, total, PendingRequest::default());
+            match engine_type {
+                FileEngineType::Sync => assert_sync_execution!(res, total),
+                FileEngineType::Async => {
+                    assert_queued!(res);
+                    assert_async_execution(&mem, &mut engine, total);
+                }
+            }
+            let mut read = [0u8; 512];
+            mem.read_slice(&mut read, GuestAddress(0)).unwrap();
+            assert_eq!(read, [0x6b; 512]);
+        }
+    }
+
+    // A write of several segments to a file opened read-only fails as a whole on both
+    // engines, with nothing transferred.
+    #[test]
+    fn test_vectored_write_to_read_only_file() {
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let mem = create_mem();
+            let temp = TempFile::new().unwrap();
+            temp.as_file().write_all_at(&[0x22; 1024], 0).unwrap();
+            let file = std::fs::File::open(temp.as_path()).unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+            let segments = vec![(GuestAddress(0), 512), (GuestAddress(4096), 512)];
+            let res = engine.writev(0, &mem, segments, 1024, PendingRequest::default());
+            match &mut engine {
+                FileEngine::Async(engine) => {
+                    assert_queued!(res);
+                    engine.drain(false).unwrap();
+                    engine.pop(&mem).unwrap().unwrap().result().unwrap_err();
+                    assert!(!engine.has_pending_ops());
+                }
+                _ => {
+                    let err = res.unwrap_err();
+                    assert_eq!(err.error.progress(), 0);
+                }
+            }
+            let mut on_disk = [0u8; 1024];
+            temp.as_file().read_exact_at(&mut on_disk, 0).unwrap();
+            assert_eq!(on_disk, [0x22; 1024]);
+        }
+    }
 }

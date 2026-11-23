@@ -3334,4 +3334,110 @@ mod tests {
             }
         }
     }
+
+    // A read of several segments that the backing file cuts short is reissued for the rest.
+    // Preparing a snapshot while that is going on waits for it and completes the request.
+    #[test]
+    fn test_prepare_save_completes_short_multi_segment_read() {
+        let mut block = default_block(FileEngineType::Async);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        // The device keeps its capacity; the file now ends inside the request.
+        block.disk().file_engine.file().set_len(512).unwrap();
+
+        mem.write_obj::<u32>(VIRTIO_BLK_T_IN, GuestAddress(0x1000))
+            .unwrap();
+        mem.write_obj::<u64>(0, GuestAddress(0x1008)).unwrap();
+        vq.dtable[0].set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+        vq.dtable[1].set(0x2000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
+        vq.dtable[2].set(0x4000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 3);
+        vq.dtable[3].set(0x8000, 1, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        simulate_queue_event(&mut block, None);
+        block.prepare_save();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 0);
+        // The sector read and the status, which says the request failed.
+        assert_eq!(vq.used.ring[0].get().len, 513);
+        assert_eq!(
+            u32::from(mem.read_obj::<u8>(GuestAddress(0x8000)).unwrap()),
+            VIRTIO_BLK_S_IOERR
+        );
+        let FileEngine::Async(engine) = &block.disk().file_engine else {
+            panic!("the block device uses the Async engine");
+        };
+        assert!(!engine.has_pending_ops());
+    }
+
+    // Requests of several segments on a device with two queues, each on its worker thread:
+    // a write through one queue and a read of the same sectors through the other.
+    #[test]
+    fn test_mq_multi_segment_request() {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_mq_block(engine, 2);
+            let mem = default_mem();
+            let vq0 = VirtQueue::new(GuestAddress(0), &mem, 16);
+            let vq1 = VirtQueue::new(GuestAddress(0x800), &mem, 16);
+            set_queue(&mut block, 0, vq0.create_queue());
+            set_queue(&mut block, 1, vq1.create_queue());
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+            assert!(block.is_threaded_active());
+            block.prepare_save();
+
+            // On queue 0, a write of sectors 2 and 3 from 0x2000 and 0x3000.
+            mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, GuestAddress(0x1000))
+                .unwrap();
+            mem.write_obj::<u64>(2, GuestAddress(0x1008)).unwrap();
+            mem.write_slice(&[0x17; 512], GuestAddress(0x2000)).unwrap();
+            mem.write_slice(&[0x29; 512], GuestAddress(0x3000)).unwrap();
+            vq0.dtable[0].set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+            vq0.dtable[1].set(0x2000, 512, VIRTQ_DESC_F_NEXT, 2);
+            vq0.dtable[2].set(0x3000, 512, VIRTQ_DESC_F_NEXT, 3);
+            vq0.dtable[3].set(0x4000, 1, VIRTQ_DESC_F_WRITE, 0);
+            vq0.avail.ring[0].set(0);
+            vq0.avail.idx.set(1);
+            mem.write_obj::<u8>(0xff, GuestAddress(0x4000)).unwrap();
+            block.kick();
+            // The pause waits until the workers have processed their queues.
+            block.prepare_save();
+            assert_eq!(vq0.used.idx.get(), 1);
+            assert_eq!(vq0.used.ring[0].get().len, 1);
+            assert_eq!(
+                u32::from(mem.read_obj::<u8>(GuestAddress(0x4000)).unwrap()),
+                VIRTIO_BLK_S_OK
+            );
+            assert_eq!(vq1.used.idx.get(), 0);
+
+            // On queue 1, a read of the same sectors into 0x6000 and 0x7000.
+            mem.write_obj::<u32>(VIRTIO_BLK_T_IN, GuestAddress(0x5000))
+                .unwrap();
+            mem.write_obj::<u64>(2, GuestAddress(0x5008)).unwrap();
+            vq1.dtable[0].set(0x5000, 16, VIRTQ_DESC_F_NEXT, 1);
+            vq1.dtable[1].set(0x6000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 2);
+            vq1.dtable[2].set(0x7000, 512, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE, 3);
+            vq1.dtable[3].set(0x8000, 1, VIRTQ_DESC_F_WRITE, 0);
+            vq1.avail.ring[0].set(0);
+            vq1.avail.idx.set(1);
+            mem.write_obj::<u8>(0xff, GuestAddress(0x8000)).unwrap();
+            block.kick();
+            block.prepare_save();
+            assert_eq!(vq1.used.idx.get(), 1);
+            assert_eq!(vq1.used.ring[0].get().len, 1025);
+            assert_eq!(
+                u32::from(mem.read_obj::<u8>(GuestAddress(0x8000)).unwrap()),
+                VIRTIO_BLK_S_OK
+            );
+            let mut first = [0u8; 512];
+            let mut second = [0u8; 512];
+            mem.read_slice(&mut first, GuestAddress(0x6000)).unwrap();
+            mem.read_slice(&mut second, GuestAddress(0x7000)).unwrap();
+            assert_eq!(first, [0x17; 512]);
+            assert_eq!(second, [0x29; 512]);
+        }
+    }
 }

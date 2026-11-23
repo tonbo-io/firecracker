@@ -19,7 +19,7 @@ use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest
 use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
-use crate::logger::log_dev_preview_warning;
+use crate::logger::{error, log_dev_preview_warning};
 use crate::utils::{Version, u64_to_usize};
 use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
 
@@ -519,8 +519,24 @@ impl AsyncFileEngine {
                 continue;
             };
             // A failed operation transferred nothing: what the earlier ones of this request
-            // read is already marked dirty, and the request fails as a whole.
+            // read is already marked dirty.
             let Ok(moved) = u32::try_from(res) else {
+                // The bytes the earlier operations transferred are reported as a short
+                // completion, which the device fails with those bytes in the used length, as
+                // the Sync engine reports the prefix of a failed vectored transfer.
+                let res = match i32::try_from(vectored.done) {
+                    Ok(done) if done > 0 => {
+                        error!(
+                            "Block transfer of several segments failed after {} bytes: {}",
+                            done,
+                            std::io::Error::from_raw_os_error(
+                                res.checked_neg().unwrap_or(libc::EIO)
+                            )
+                        );
+                        done
+                    }
+                    _ => res,
+                };
                 self.ready.push_back(Cqe::new(res, wrapped));
                 continue;
             };
@@ -547,7 +563,14 @@ impl AsyncFileEngine {
         &mut self,
         mem: &GuestMemoryMmap,
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
-        self.harvest()?;
+        if let Err(err) = self.harvest() {
+            // Completions already taken off the ring are not held back by the error: it is
+            // returned once they are handed over.
+            if self.ready.is_empty() {
+                return Err(err);
+            }
+            error!("Failed to take block completions off the ring: {:?}", err);
+        }
         let cqe = self.ready.pop_front().map(|cqe| {
             let count = cqe.count();
             cqe.map_user_data(|wrapped_user_data| {
