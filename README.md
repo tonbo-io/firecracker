@@ -1,4 +1,8 @@
-# CI for the patch branches
+# CI for the earlier patch branches
+
+The current patch stack lives on `main` and is checked by
+`.github/workflows/tonbo.yml` there (see `TONBO.md` on `main`). This branch
+checks the earlier stacks kept as `tonbo/<upstream commit>` branches.
 
 This branch holds only the workflow that checks this fork's patch branches.
 It shares no history with them, so a patch branch's tree stays exactly the
