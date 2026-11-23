@@ -1665,4 +1665,394 @@ mod tests {
             prop_assert!(parse_multi(&vq, NUM_DISK_SECTORS).is_err());
         }
     }
+
+    // Requests of several data segments from a hostile driver. Each chain is built in guest
+    // memory as a driver would build it, and goes through the parser and, when the parser
+    // accepts it, through the Sync engine of a disk backed by a real file.
+
+    const HOSTILE_DISK_SECTORS: u64 = 512;
+
+    /// A disk of `HOSTILE_DISK_SECTORS` sectors of 0xdd on the Sync engine, with its file.
+    fn hostile_disk() -> (vmm_sys_util::tempfile::TempFile, DiskProperties) {
+        use std::os::unix::fs::FileExt;
+
+        use crate::devices::virtio::block::virtio::device::{DiskImageFormat, FileEngineType};
+
+        let backing = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let len = usize::try_from(HOSTILE_DISK_SECTORS).unwrap() * 512;
+        backing.as_file().write_all_at(&vec![0xdd; len], 0).unwrap();
+        let disk = DiskProperties::new(
+            backing.as_path().to_str().unwrap(),
+            false,
+            FileEngineType::Sync,
+            DiskImageFormat::Raw,
+            false,
+        )
+        .unwrap();
+        assert_eq!(disk.nsectors, HOSTILE_DISK_SECTORS);
+        (backing, disk)
+    }
+
+    /// Whether the disk's file still holds what `hostile_disk` wrote, and nothing else.
+    fn disk_untouched(backing: &vmm_sys_util::tempfile::TempFile) -> bool {
+        use std::os::unix::fs::FileExt;
+
+        let len = usize::try_from(HOSTILE_DISK_SECTORS).unwrap() * 512;
+        let mut bytes = vec![0u8; len];
+        backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+        backing.as_file().metadata().unwrap().len() == len as u64 && bytes == vec![0xdd; len]
+    }
+
+    /// Parses the chain in `vq` and, if the parser accepts it, runs it on `disk`. Returns the
+    /// length the device would put in the used ring.
+    fn run_chain(vq: &VirtQueue<'_>, disk: &mut DiskProperties) -> Result<u32, VirtioBlockError> {
+        let request = parse_multi(vq, disk.nsectors)?;
+        let metrics = BlockDeviceMetrics::default();
+        match request.process(disk, 0, vq.memory(), &metrics, false) {
+            ProcessingResult::Executed(finished) => Ok(finished.num_bytes_to_mem),
+            other => panic!("the Sync engine finishes a request inline: {other:?}"),
+        }
+    }
+
+    /// The status byte the device wrote for the chain of `multi_chain` or `long_chain`.
+    fn status_at(mem: &GuestMemoryMmap, addr: u64) -> u32 {
+        u32::from(mem.read_obj::<u8>(GuestAddress(addr)).unwrap())
+    }
+
+    /// A chain of `segments` data descriptors of one sector each, far from the queue's own
+    /// memory so that the queue may have 256 entries: the header at 0x10000, segment `i`
+    /// (from 1) at `0x20000 + i * 0x1000`, the status at 0x1ff000.
+    fn long_chain(
+        vq: &VirtQueue<'_>,
+        request_type: u32,
+        segments: u16,
+        write_only: bool,
+    ) -> Vec<DataSegment> {
+        let mem = vq.memory();
+        mem.write_obj(RequestHeader::new(request_type, 0), GuestAddress(0x10000))
+            .unwrap();
+        vq.dtable[0].set(0x10000, 16, VIRTQ_DESC_F_NEXT, 1);
+        let mut data = Vec::new();
+        for idx in 1..=segments {
+            let addr = 0x20000 + 0x1000 * u64::from(idx);
+            let flags = VIRTQ_DESC_F_NEXT | if write_only { VIRTQ_DESC_F_WRITE } else { 0 };
+            vq.dtable[usize::from(idx)].set(addr, 512, flags, idx + 1);
+            data.push((GuestAddress(addr), 512));
+        }
+        vq.dtable[usize::from(segments) + 1].set(0x1ff000, 1, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        data
+    }
+
+    // Readable and writable descriptors in the wrong order: refused, the disk untouched.
+    #[test]
+    fn test_hostile_descriptor_order() {
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        // A write with a device-writable descriptor between its data descriptors.
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            0,
+            &[(512, false), (512, true), (512, false)],
+        );
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::UnexpectedReadOnlyDescriptor)
+        ));
+        // A read with a device-readable descriptor after or before its data descriptors.
+        for data in [
+            [(512, true), (512, false), (512, true)],
+            [(512, false), (512, true), (512, true)],
+        ] {
+            multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &data);
+            assert!(matches!(
+                run_chain(&vq, &mut disk),
+                Err(VirtioBlockError::UnexpectedReadOnlyDescriptor)
+            ));
+        }
+        // A read without a single writable byte, not even for the status.
+        multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &[(512, false)]);
+        vq.dtable[2].flags.set(0);
+        run_chain(&vq, &mut disk).unwrap_err();
+        assert!(disk_untouched(&backing));
+
+        // A write whose data descriptors are all device-writable carries no data. It is a
+        // write of nothing, and its status goes to the last writable byte of the chain.
+        multi_chain(&vq, VIRTIO_BLK_T_OUT, 0, &[(512, true), (512, true)]);
+        mem.write_obj(0xffu8, GuestAddress(0x20000)).unwrap();
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+        assert_eq!(status_at(&mem, 0x20000), VIRTIO_BLK_S_OK);
+        assert!(disk_untouched(&backing));
+    }
+
+    // Descriptors of no bytes are not segments.
+    #[test]
+    fn test_hostile_zero_length_segments() {
+        use std::os::unix::fs::FileExt;
+
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        let segments = multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            1,
+            &[
+                (0, false),
+                (512, false),
+                (0, false),
+                (512, false),
+                (0, false),
+            ],
+        );
+        mem.write_slice(&[0x11; 512], segments[1].0).unwrap();
+        mem.write_slice(&[0x22; 512], segments[3].0).unwrap();
+        let request = parse_multi(&vq, disk.nsectors).unwrap();
+        assert_eq!(request.segments(), vec![segments[1], segments[3]]);
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+        assert_eq!(status_at(&mem, 0x20000), VIRTIO_BLK_S_OK);
+        let mut written = [0u8; 1024];
+        backing.as_file().read_exact_at(&mut written, 512).unwrap();
+        assert_eq!(&written[..512], &[0x11; 512]);
+        assert_eq!(&written[512..], &[0x22; 512]);
+
+        // Only empty data descriptors: a read of nothing.
+        multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &[(0, true), (0, true)]);
+        let request = parse_multi(&vq, disk.nsectors).unwrap();
+        assert_eq!(request.data_len, 0);
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+    }
+
+    // A data descriptor that crosses from one guest memory region into the next is read as
+    // two segments; one that runs into a hole between regions is refused with nothing read.
+    #[test]
+    fn test_hostile_segment_across_regions() {
+        let (_backing, mut disk) = hostile_disk();
+
+        let mem = multi_region_mem(&[(GuestAddress(0), 0x4000), (GuestAddress(0x4000), 0x3c000)]);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &[(512, true), (512, true)]);
+        vq.dtable[1].addr.set(0x3f00);
+        vq.dtable[2].addr.set(0x6000);
+        mem.write_slice(&[0xa5; 512], GuestAddress(0x3f00)).unwrap();
+        let request = parse_multi(&vq, disk.nsectors).unwrap();
+        assert_eq!(
+            request.segments(),
+            vec![
+                (GuestAddress(0x3f00), 256),
+                (GuestAddress(0x4000), 256),
+                (GuestAddress(0x6000), 512),
+            ]
+        );
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1025);
+        let mut read = [0u8; 512];
+        mem.read_slice(&mut read, GuestAddress(0x3f00)).unwrap();
+        assert_eq!(read, [0xdd; 512]);
+
+        let mem = multi_region_mem(&[(GuestAddress(0), 0x4000), (GuestAddress(0x8000), 0x38000)]);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &[(512, true), (512, true)]);
+        vq.dtable[1].addr.set(0x3f00);
+        vq.dtable[2].addr.set(0x9000);
+        mem.write_slice(&[0xa5; 256], GuestAddress(0x3f00)).unwrap();
+        mem.write_slice(&[0xa5; 512], GuestAddress(0x9000)).unwrap();
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::GuestMemory(_))
+        ));
+        let mut before_hole = [0u8; 256];
+        mem.read_slice(&mut before_hole, GuestAddress(0x3f00))
+            .unwrap();
+        assert_eq!(before_hole, [0xa5; 256]);
+        let mut other = [0u8; 512];
+        mem.read_slice(&mut other, GuestAddress(0x9000)).unwrap();
+        assert_eq!(other, [0xa5; 512]);
+    }
+
+    // A data descriptor outside guest memory in the middle of a chain: the request is refused
+    // by the parser, before any host I/O. A write has written nothing of the segments before
+    // it to the disk, and a read has put nothing in them.
+    #[test]
+    fn test_hostile_segment_outside_guest_memory() {
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        for bad in [
+            // Past the end of guest memory.
+            0x40000,
+            // Starting inside it and running past its end.
+            0x3ff00,
+            // Wrapping around the address space.
+            u64::MAX - 255,
+        ] {
+            let segments = multi_chain(
+                &vq,
+                VIRTIO_BLK_T_OUT,
+                0,
+                &[(512, false), (512, false), (512, false)],
+            );
+            mem.write_slice(&[0x33; 512], segments[0].0).unwrap();
+            vq.dtable[2].addr.set(bad);
+            assert!(matches!(
+                run_chain(&vq, &mut disk),
+                Err(VirtioBlockError::GuestMemory(_))
+            ));
+            assert!(disk_untouched(&backing));
+
+            let segments = multi_chain(
+                &vq,
+                VIRTIO_BLK_T_IN,
+                0,
+                &[(512, true), (512, true), (512, true)],
+            );
+            mem.write_slice(&[0xa5; 512], segments[0].0).unwrap();
+            mem.write_slice(&[0xa5; 512], segments[2].0).unwrap();
+            vq.dtable[2].addr.set(bad);
+            assert!(matches!(
+                run_chain(&vq, &mut disk),
+                Err(VirtioBlockError::GuestMemory(_))
+            ));
+            for segment in [segments[0], segments[2]] {
+                let mut bytes = [0u8; 512];
+                mem.read_slice(&mut bytes, segment.0).unwrap();
+                assert_eq!(bytes, [0xa5; 512]);
+            }
+        }
+    }
+
+    // Lengths that overflow, and totals that are not whole sectors or do not fit the disk:
+    // refused from the lengths alone, whatever the addresses are.
+    #[test]
+    fn test_hostile_lengths() {
+        let mem = single_region_mem(0x40000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let (backing, mut disk) = hostile_disk();
+
+        // More than 2^32 bytes in the chain.
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            0,
+            &[
+                (0x8000_0000, false),
+                (0x8000_0000, false),
+                (0x8000_0000, false),
+            ],
+        );
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::InvalidDataLength)
+        ));
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_IN,
+            0,
+            &[(u32::MAX, true), (u32::MAX, true), (u32::MAX, true)],
+        );
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::InvalidDataLength)
+        ));
+        // A total that is not a whole number of sectors, from segments of whole sectors or not.
+        for data in [[(512, false), (488, false)], [(100, false), (300, false)]] {
+            multi_chain(&vq, VIRTIO_BLK_T_OUT, 0, &data);
+            assert!(matches!(
+                run_chain(&vq, &mut disk),
+                Err(VirtioBlockError::InvalidDataLength)
+            ));
+        }
+        // Whole sectors from segments that are not: accepted.
+        multi_chain(&vq, VIRTIO_BLK_T_IN, 0, &[(100, true), (412, true)]);
+        assert_eq!(run_chain(&vq, &mut disk).unwrap(), 513);
+        // One sector past the end of the disk, counted over the segments.
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            HOSTILE_DISK_SECTORS - 2,
+            &[(512, false), (512, false), (512, false)],
+        );
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::InvalidOffset)
+        ));
+        // A sector that overflows with the length.
+        multi_chain(
+            &vq,
+            VIRTIO_BLK_T_OUT,
+            u64::MAX,
+            &[(512, false), (512, false)],
+        );
+        assert!(matches!(
+            run_chain(&vq, &mut disk),
+            Err(VirtioBlockError::InvalidOffset)
+        ));
+        assert!(disk_untouched(&backing));
+    }
+
+    // More data segments than the 32 the device advertises, up to the longest chain a queue
+    // of 256 holds (254 data descriptors): the device does not hold a driver to `seg_max`,
+    // and such a request is written and read back whole, in order.
+    #[test]
+    fn test_hostile_more_segments_than_advertised() {
+        use std::os::unix::fs::FileExt;
+
+        for count in [33u16, 253, 254] {
+            let mem = single_region_mem(0x200000);
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 256);
+            let (backing, mut disk) = hostile_disk();
+
+            let segments = long_chain(&vq, VIRTIO_BLK_T_OUT, count, false);
+            let mut expected = Vec::new();
+            for (i, &(addr, len)) in segments.iter().enumerate() {
+                let bytes = vec![u8::try_from(i % 251).unwrap(); usize::try_from(len).unwrap()];
+                mem.write_slice(&bytes, addr).unwrap();
+                expected.extend(bytes);
+            }
+            let request = parse_multi(&vq, disk.nsectors).unwrap();
+            assert_eq!(request.segments(), segments);
+            assert_eq!(request.data_len, u32::from(count) * 512);
+            assert_eq!(run_chain(&vq, &mut disk).unwrap(), 1);
+            assert_eq!(status_at(&mem, 0x1ff000), VIRTIO_BLK_S_OK);
+            let mut written = vec![0u8; expected.len()];
+            backing.as_file().read_exact_at(&mut written, 0).unwrap();
+            assert_eq!(written, expected);
+
+            let segments = long_chain(&vq, VIRTIO_BLK_T_IN, count, true);
+            for &(addr, len) in &segments {
+                mem.write_slice(&vec![0u8; usize::try_from(len).unwrap()], addr)
+                    .unwrap();
+            }
+            assert_eq!(
+                run_chain(&vq, &mut disk).unwrap(),
+                u32::from(count) * 512 + 1
+            );
+            let mut read = Vec::new();
+            for &(addr, len) in &segments {
+                let mut bytes = vec![0u8; usize::try_from(len).unwrap()];
+                mem.read_slice(&mut bytes, addr).unwrap();
+                read.extend(bytes);
+            }
+            assert_eq!(read, expected);
+        }
+    }
+
+    // A chain that loops back on itself never reaches a status descriptor.
+    #[test]
+    fn test_hostile_looping_chain() {
+        let mem = single_region_mem(0x200000);
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 256);
+        let (backing, mut disk) = hostile_disk();
+
+        long_chain(&vq, VIRTIO_BLK_T_OUT, 8, false);
+        // The last data descriptor points back at the first.
+        vq.dtable[8].next.set(1);
+        run_chain(&vq, &mut disk).unwrap_err();
+        assert!(disk_untouched(&backing));
+    }
 }
