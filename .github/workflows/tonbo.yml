@@ -1,0 +1,107 @@
+name: Tonbo patch stack
+
+# Checks the patches this fork carries on top of upstream (TONBO.md): the
+# stack is upstream-main..main. It runs on GitHub-hosted runners only, holds
+# no secrets and writes nothing. Upstream's own workflows stay disabled in
+# this fork.
+"on":
+  push:
+    branches:
+      - main
+      - "wip/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tonbo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stack:
+    name: Patch stack
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    env:
+      BASE: origin/upstream-main
+      OURS: 12211036+ethe@users.noreply.github.com
+      LIBSECCOMP_VER: v2.6.1
+      LIBSECCOMP_COMMIT: a81cc2de8ee7a33633defc88bb8a2d986b421613
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The stack sits on upstream-main, linear and signed off
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$BASE" HEAD
+          [ -z "$(git rev-list --merges "$BASE..HEAD")" ]
+          for commit in $(git rev-list --reverse "$BASE..HEAD"); do
+            git log -1 --format=%B "$commit" | grep -q '^Signed-off-by: ' \
+              || { echo "no Signed-off-by: $(git log -1 --format='%h %s' "$commit")" >&2; exit 1; }
+          done
+          {
+            echo "base \`$(git rev-parse "$BASE")\`"
+            echo "tip \`$(git rev-parse HEAD)\`, tree \`$(git rev-parse 'HEAD^{tree}')\`"
+            echo '```'
+            git log --format='%h %an: %s' --reverse "$BASE..HEAD"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Commit messages of our commits (upstream's gitlint rules)
+        run: |
+          set -euo pipefail
+          pipx install gitlint-core==0.19.1
+          for commit in $(git rev-list --reverse --author="$OURS" "$BASE..HEAD"); do
+            gitlint --commit "$commit"
+          done
+      - name: Toolchain and build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q autoconf automake gperf libtool make
+          # seccompiler links libseccomp from /usr/local/lib, at the version
+          # upstream's development container builds; the distribution's
+          # package is older than the API it uses.
+          version=$(sed -n 's/^ENV LIBSECCOMP_VER="\(.*\)"$/\1/p' tools/devctr/Dockerfile)
+          [ "$version" = "$LIBSECCOMP_VER" ]
+          git init -q "$RUNNER_TEMP/libseccomp"
+          git -C "$RUNNER_TEMP/libseccomp" fetch -q --depth 1 --no-tags \
+            https://github.com/seccomp/libseccomp.git "refs/tags/$version"
+          [ "$(git -C "$RUNNER_TEMP/libseccomp" rev-parse 'FETCH_HEAD^{commit}')" = "$LIBSECCOMP_COMMIT" ]
+          git -C "$RUNNER_TEMP/libseccomp" checkout -q --detach "$LIBSECCOMP_COMMIT"
+          (
+            cd "$RUNNER_TEMP/libseccomp"
+            ./autogen.sh >/dev/null
+            ./configure -q --enable-static=yes --enable-shared=false
+            make -s -j"$(nproc)"
+            sudo make -s install
+          )
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component clippy --component rustfmt --no-self-update
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Every commit of the stack passes clippy by itself
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          tip=$(git rev-parse HEAD)
+          for commit in $(git rev-list --reverse "$BASE..$tip"); do
+            echo "::group::$(git log -1 --format='%h %s' "$commit")"
+            git checkout -q --detach "$commit"
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+          git checkout -q --detach "$tip"
+      - name: Unit tests of what the patches touch
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          # For the runner's glibc target, without KVM. One thread: the
+          # device tests share per-drive and global metrics (upstream runs
+          # each test in its own process with nextest). The net tests open
+          # a tap device, which the runner does not allow.
+          cargo test --locked -p vmm --lib -- --test-threads=1 \
+            --skip devices::virtio::net \
+            devices::virtio::block io_uring rate_limiter vstate::memory
