@@ -13,7 +13,9 @@ use vmm_sys_util::eventfd::EventFd;
 use super::device::BlockResources;
 use super::io::{BlockIoError, FileEngine, async_io};
 use super::metrics::BlockDeviceMetrics;
-use super::{FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError};
+use super::{
+    FinishedRequest, IoErr, ProcessingResult, Request, VIRTIO_BLK_S_IOERR, VirtioBlockError,
+};
 use crate::EventManager;
 use crate::devices::virtio::device::ActiveState;
 use crate::devices::virtio::persist::QueueState;
@@ -23,6 +25,7 @@ use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::RateLimiter;
 use crate::seccomp::{BpfProgram, apply_filter};
 use crate::snapshot::Persist;
+use crate::vstate::memory::Bytes;
 
 /// Runtime state and processing logic for an active block device.
 #[derive(Debug)]
@@ -136,40 +139,53 @@ impl BlockWorker {
 
         while let Some(head) = queue.pop_or_enable_notification()? {
             self.metrics.remaining_reqs_count.add(queue.len().into());
-            let processing_result =
-                match Request::parse(&head, &self.active_state.mem, self.resources.disk.nsectors) {
-                    Ok(request) => {
-                        let is_rate_limited = {
-                            let mut rate_limiter = rate_limiter
-                                .lock()
-                                .expect("Poisoned block rate limiter lock");
-                            request.rate_limit(&mut rate_limiter)
-                        };
-                        if is_rate_limited {
-                            // Stop processing the queue and return this descriptor chain to the
-                            // avail ring, for later processing.
-                            queue.undo_pop();
-                            self.metrics.rate_limiter_throttled_events.inc();
-                            break;
-                        }
+            let processing_result = match Request::parse_with_status(
+                &head,
+                &self.active_state.mem,
+                self.resources.disk.nsectors,
+            ) {
+                Ok(request) => {
+                    let is_rate_limited = {
+                        let mut rate_limiter = rate_limiter
+                            .lock()
+                            .expect("Poisoned block rate limiter lock");
+                        request.rate_limit(&mut rate_limiter)
+                    };
+                    if is_rate_limited {
+                        // Stop processing the queue and return this descriptor chain to the
+                        // avail ring, for later processing.
+                        queue.undo_pop();
+                        self.metrics.rate_limiter_throttled_events.inc();
+                        break;
+                    }
 
-                        request.process(
-                            &mut self.resources.disk,
-                            head.index,
-                            &self.active_state.mem,
-                            &self.metrics,
-                            self.discard_supported,
-                        )
-                    }
-                    Err(err) => {
-                        error!("Failed to parse available descriptor chain: {:?}", err);
-                        self.metrics.execute_fails.inc();
-                        ProcessingResult::Executed(FinishedRequest {
-                            num_bytes_to_mem: 0,
-                            desc_idx: head.index,
-                        })
-                    }
-                };
+                    request.process(
+                        &mut self.resources.disk,
+                        head.index,
+                        &self.active_state.mem,
+                        &self.metrics,
+                        self.discard_supported,
+                    )
+                }
+                Err((err, status)) => {
+                    error!("Failed to parse available descriptor chain: {:?}", err);
+                    self.metrics.execute_fails.inc();
+                    // A request refused for a buffer outside guest memory or a bad length
+                    // used to fail at its I/O, with an error in its status byte. Keep
+                    // telling the driver so, when the chain has a status byte: left alone,
+                    // the byte may still say that an earlier request succeeded.
+                    let num_bytes_to_mem = status.map_or(0, |addr| {
+                        self.active_state
+                            .mem
+                            .write_obj(u8::try_from(VIRTIO_BLK_S_IOERR).unwrap(), addr)
+                            .map_or(0, |()| 1)
+                    });
+                    ProcessingResult::Executed(FinishedRequest {
+                        num_bytes_to_mem,
+                        desc_idx: head.index,
+                    })
+                }
+            };
 
             match processing_result {
                 ProcessingResult::Submitted => {}

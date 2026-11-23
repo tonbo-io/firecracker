@@ -1848,7 +1848,8 @@ mod tests {
 
             assert_eq!(vq.used.idx.get(), 1);
             assert_eq!(vq.used.ring[0].get().id, 0);
-            assert_eq!(vq.used.ring[0].get().len, 0);
+            // Refused by the parser, which says so in the status byte.
+            assert_eq!(vq.used.ring[0].get().len, 1);
         }
     }
 
@@ -1944,7 +1945,8 @@ mod tests {
 
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
             }
 
             {
@@ -1964,7 +1966,8 @@ mod tests {
 
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
             }
         }
     }
@@ -2072,7 +2075,8 @@ mod tests {
 
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
 
                 // Check that the data wasn't written to the file
                 let mut buf = [0u8; 512];
@@ -2113,7 +2117,8 @@ mod tests {
                 vq.used.idx.set(0);
 
                 check_metric_after_block!(
-                    &block.metrics.invalid_reqs_count,
+                    // The parser refuses it, before any I/O.
+                    &block.metrics.execute_fails,
                     1,
                     simulate_queue_and_async_completion_events(&mut block, true)
                 );
@@ -2170,7 +2175,8 @@ mod tests {
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
                 // The descriptor should have been discarded.
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
 
                 // Check that no data was read.
                 let mut buf = [0u8; 512];
@@ -2236,7 +2242,8 @@ mod tests {
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
                 // The descriptor should have been discarded.
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
 
                 // Check that no data was read.
                 let mut buf = [0u8; 512];
@@ -2359,7 +2366,8 @@ mod tests {
                     .set(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
 
                 check_metric_after_block!(
-                    &block.metrics.invalid_reqs_count,
+                    // The parser refuses it, before any I/O.
+                    &block.metrics.execute_fails,
                     1,
                     simulate_queue_and_async_completion_events(&mut block, true)
                 );
@@ -2483,7 +2491,8 @@ mod tests {
                 simulate_queue_event(&mut block, Some(true));
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
-                assert_eq!(vq.used.ring[0].get().len, 0);
+                // Refused by the parser, which says so in the status byte.
+                assert_eq!(vq.used.ring[0].get().len, 1);
             }
         }
     }
