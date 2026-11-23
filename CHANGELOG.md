@@ -10,6 +10,20 @@ and this project adheres to
 
 ### Added
 
+- [#6441](https://github.com/firecracker-microvm/firecracker/issues/6441): The
+  virtio-block device now offers `VIRTIO_BLK_F_SEG_MAX` with `seg_max` 32, on
+  both IO engines, so a guest sends a buffer of scattered pages as one request
+  of several data segments instead of one request per page. Such a request is
+  transferred with one vectored read or write, and a rate limiter is charged one
+  op and the request's bytes for it. The request parser now reads a descriptor
+  chain as a readable and a writable byte stream: the header is the first 16
+  readable bytes and the status the last writable byte, whatever the descriptor
+  boundaries are, and a request that is refused has `VIRTIO_BLK_S_IOERR` written
+  to its status byte. This bumps the snapshot version to `13.1.0`: the saved
+  layout is unchanged, but a snapshot of a device that offered the feature must
+  not be loaded by a version that takes one data descriptor per request. A
+  `13.0.0` snapshot still loads, and its block devices keep offering one
+  segment.
 - [#5935](https://github.com/firecracker-microvm/firecracker/pull/5935): Added
   virtio-blk discard support for drives using the `Async` IO engine. Regular
   backing files use `IORING_OP_FALLOCATE`; block devices use
