@@ -28,6 +28,11 @@ pub const SECTOR_SIZE: u32 = (0x01_u32) << SECTOR_SHIFT;
 /// Keep this bounded so guest fstrim is split into predictable chunks instead
 /// of letting one large discard ioctl block the VMM thread for too long.
 pub const MAX_DISCARD_SECTORS: u32 = (128_u32 << 20) / SECTOR_SIZE;
+/// Data segments per request the device advertises (`VIRTIO_BLK_F_SEG_MAX`), so that a driver
+/// sends a buffer of scattered pages as one request rather than one request per page. With the
+/// header and the status, such a request takes 34 of a queue's 256 descriptors. The parser
+/// does not enforce it: a chain is bounded by the queue size and by its total length.
+pub const SEG_MAX: u32 = 32;
 /// The number of queues of block device.
 pub const DEFAULT_BLOCK_NUM_QUEUES: u16 = 1;
 /// How long a block device's rate limiter waits after a bucket runs dry, instead of the

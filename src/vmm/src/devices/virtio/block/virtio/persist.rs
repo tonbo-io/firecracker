@@ -179,6 +179,9 @@ impl Persist<'_> for VirtioBlock {
             blk_size: state.blk_size,
             topology: state.topology,
             discard_sector_alignment: state.discard_sector_alignment,
+            // The features are the saved ones: a device saved before `VIRTIO_BLK_F_SEG_MAX`
+            // existed keeps offering one data segment per request.
+            seg_max: device::seg_max(state.virtio_state.avail_features),
             num_queues: num_queues.to_le(),
             ..Default::default()
         };

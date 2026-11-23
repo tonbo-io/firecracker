@@ -25,7 +25,7 @@ use super::io::{self as block_io, FileEngine};
 use super::worker::{BlockWorker, FlushMode, WorkerHandle};
 use super::{
     BLOCK_QUEUE_SIZE, BLOCK_REFILL_TIMER, DEFAULT_BLOCK_NUM_QUEUES, MAX_DISCARD_SECTORS,
-    SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
+    SECTOR_SHIFT, SECTOR_SIZE, SEG_MAX, VirtioBlockError,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
@@ -33,7 +33,7 @@ use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMe
 use crate::devices::virtio::device::{ActiveState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_MQ,
-    VIRTIO_BLK_F_RO, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_ID_BYTES,
+    VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_ID_BYTES,
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -405,6 +405,17 @@ impl Default for ConfigSpace {
     }
 }
 
+/// The `seg_max` the config space shows for a device that offers `avail_features`: none when
+/// it does not offer `VIRTIO_BLK_F_SEG_MAX`, as a device restored from a snapshot taken before
+/// the feature existed does not.
+pub(crate) fn seg_max(avail_features: u64) -> u32 {
+    if avail_features & (1u64 << VIRTIO_BLK_F_SEG_MAX) != 0 {
+        SEG_MAX.to_le()
+    } else {
+        0
+    }
+}
+
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
 unsafe impl ByteValued for ConfigSpace {}
 
@@ -613,7 +624,8 @@ impl VirtioBlock {
             | (1u64 << VIRTIO_RING_F_EVENT_IDX)
             | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
             | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
-            | (1u64 << VIRTIO_BLK_F_MQ);
+            | (1u64 << VIRTIO_BLK_F_MQ)
+            | (1u64 << VIRTIO_BLK_F_SEG_MAX);
 
         if config.cache_type == CacheType::Writeback {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -628,6 +640,7 @@ impl VirtioBlock {
 
         let mut config_space = ConfigSpace {
             capacity: resources[0].disk.nsectors.to_le(),
+            seg_max: seg_max(avail_features),
             num_queues: num_queues.to_le(),
             ..Default::default()
         };
@@ -1549,7 +1562,8 @@ mod tests {
                 | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                 | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
                 | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
-                | (1u64 << VIRTIO_BLK_F_MQ);
+                | (1u64 << VIRTIO_BLK_F_MQ)
+                | (1u64 << VIRTIO_BLK_F_SEG_MAX);
 
             assert_eq!(
                 block.avail_features_by_page(0),
@@ -1794,6 +1808,7 @@ mod tests {
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
             let expected_config_space = ConfigSpace {
                 capacity: 8,
+                seg_max: SEG_MAX,
                 ..Default::default()
             };
             assert_eq!(config, expected_config_space.as_slice());
@@ -3214,6 +3229,108 @@ mod tests {
                 block.activate(mem, default_interrupt()).unwrap();
                 assert!(block.is_activated());
                 assert_eq!(block.is_threaded_active(), threaded);
+            }
+        }
+    }
+
+    // A request of several data segments through the device, on both engines: one entry in the
+    // used ring, one status byte, one interrupt, and one charge of the rate limiter (an op and
+    // the bytes of all its segments).
+    #[test]
+    fn test_multi_segment_request() {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block(engine);
+            let mem = default_mem();
+            let interrupt = default_interrupt();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+
+            // A limiter with exactly one op and three sectors, which nothing refills.
+            let clock = MockClock::new();
+            let rl = RateLimiter::new_mocked(1536, 0, 100_000, 1, 0, 100_000, &clock);
+            set_rate_limiter(&mut block, rl);
+            block.activate(mem.clone(), interrupt).unwrap();
+
+            // The header at 0x1000, three segments of one sector at 0x2000, 0x4000 and 0x6000,
+            // the status at 0x8000; the request is for sectors 1 to 3.
+            let segments = [0x2000u64, 0x4000, 0x6000];
+            let chain = |request_type: u32, data_flags: u16| {
+                mem.write_obj::<u32>(request_type, GuestAddress(0x1000))
+                    .unwrap();
+                mem.write_obj::<u64>(1, GuestAddress(0x1008)).unwrap();
+                vq.dtable[0].set(0x1000, 16, VIRTQ_DESC_F_NEXT, 1);
+                for (idx, &addr) in (1u16..).zip(&segments) {
+                    vq.dtable[usize::from(idx)].set(
+                        addr,
+                        512,
+                        VIRTQ_DESC_F_NEXT | data_flags,
+                        idx + 1,
+                    );
+                }
+                vq.dtable[4].set(0x8000, 1, VIRTQ_DESC_F_WRITE, 0);
+                vq.avail.ring[0].set(0);
+                vq.avail.idx.set(1);
+                mem.write_obj::<u8>(0xff, GuestAddress(0x8000)).unwrap();
+            };
+
+            // Write.
+            chain(VIRTIO_BLK_T_OUT, 0);
+            for (fill, &addr) in (1u8..).zip(&segments) {
+                mem.write_slice(&[fill; 512], GuestAddress(addr)).unwrap();
+            }
+            check_metric_after_block!(
+                &block.metrics.write_count,
+                1,
+                simulate_queue_and_async_completion_events(&mut block, true)
+            );
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(vq.used.ring[0].get().id, 0);
+            assert_eq!(vq.used.ring[0].get().len, 1);
+            assert_eq!(
+                u32::from(mem.read_obj::<u8>(GuestAddress(0x8000)).unwrap()),
+                VIRTIO_BLK_S_OK
+            );
+            let mut on_disk = [0u8; 1536];
+            block
+                .disk()
+                .file_engine
+                .file()
+                .read_exact_at(&mut on_disk, 512)
+                .unwrap();
+            for (fill, sector) in (1u8..).zip(on_disk.chunks(512)) {
+                assert_eq!(sector, &[fill; 512]);
+            }
+            // One request: one op and the bytes of its three segments, and not blocked.
+            {
+                let limiter = block.lock_rate_limiter();
+                assert_eq!(limiter.ops().unwrap().budget(), 0);
+                assert_eq!(limiter.bandwidth().unwrap().budget(), 0);
+                assert!(!limiter.is_blocked());
+            }
+
+            // Read it back into the same segments, without a limiter.
+            set_rate_limiter(&mut block, RateLimiter::default());
+            vq.used.idx.set(0);
+            set_queue(&mut block, 0, vq.create_queue());
+            chain(VIRTIO_BLK_T_IN, VIRTQ_DESC_F_WRITE);
+            for &addr in &segments {
+                mem.write_slice(&[0u8; 512], GuestAddress(addr)).unwrap();
+            }
+            check_metric_after_block!(
+                &block.metrics.read_count,
+                1,
+                simulate_queue_and_async_completion_events(&mut block, true)
+            );
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(vq.used.ring[0].get().len, 1537);
+            assert_eq!(
+                u32::from(mem.read_obj::<u8>(GuestAddress(0x8000)).unwrap()),
+                VIRTIO_BLK_S_OK
+            );
+            for (fill, &addr) in (1u8..).zip(&segments) {
+                let mut sector = [0u8; 512];
+                mem.read_slice(&mut sector, GuestAddress(addr)).unwrap();
+                assert_eq!(sector, [fill; 512]);
             }
         }
     }
