@@ -121,7 +121,8 @@ impl Persist<'_> for VirtioBlock {
     ) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
-            .map_err(VirtioBlockError::RateLimiter)?;
+            .map_err(VirtioBlockError::RateLimiter)?
+            .with_refill_timer(BLOCK_REFILL_TIMER);
         let rate_limiter_config: RateLimiterConfig = (&rate_limiter).into();
         let num_queues = state
             .num_queues

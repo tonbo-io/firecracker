@@ -24,8 +24,8 @@ pub use super::io::DiskImageFormat;
 use super::io::{self as block_io, FileEngine};
 use super::worker::{BlockWorker, FlushMode, WorkerHandle};
 use super::{
-    BLOCK_QUEUE_SIZE, DEFAULT_BLOCK_NUM_QUEUES, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE,
-    VirtioBlockError,
+    BLOCK_QUEUE_SIZE, BLOCK_REFILL_TIMER, DEFAULT_BLOCK_NUM_QUEUES, MAX_DISCARD_SECTORS,
+    SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
@@ -604,7 +604,8 @@ impl VirtioBlock {
         let rate_limiter = config
             .rate_limiter
             .map(RateLimiter::from)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .with_refill_timer(BLOCK_REFILL_TIMER);
         let rate_limiter_config: RateLimiterConfig = (&rate_limiter).into();
         config.rate_limiter = rate_limiter_config.into_option();
 
