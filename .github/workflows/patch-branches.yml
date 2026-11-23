@@ -1,0 +1,64 @@
+name: Patch branches
+
+# Checks the patch branches of this fork (see README.md on this branch). It
+# lives on its own orphan branch so that a patch branch's tree stays exactly
+# upstream's tree plus the patches. It runs on GitHub-hosted runners only,
+# holds no secrets and writes nothing.
+#
+# It runs when this branch is pushed. To check a patch branch's new tip,
+# re-run the latest run (a re-run checks out the branch's current tip); to
+# check a new branch, add it to the matrix.
+"on":
+  push:
+    branches:
+      - tonbo/ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-branches
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.branch }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - tonbo/d9f9a57d
+          - tonbo/d9f9a57d-seg-max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+      - name: Record what is checked
+        run: |
+          set -euo pipefail
+          {
+            echo "branch \`${{ matrix.branch }}\`"
+            echo "commit \`$(git rev-parse HEAD)\`"
+            echo "tree \`$(git rev-parse 'HEAD^{tree}')\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --no-self-update
+      - name: Clippy
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          cargo clippy --locked -p vmm --all-targets -- -D warnings
+      - name: Unit tests of what the patches touch
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          # For the runner's glibc target, without KVM. One thread: the
+          # device tests share per-drive and global metrics (upstream runs
+          # each test in its own process with nextest). The net tests open
+          # a tap device, which the runner does not allow.
+          cargo test --locked -p vmm --lib -- --test-threads=1 \
+            --skip devices::virtio::net \
+            devices::virtio::block io_uring rate_limiter vstate::memory
