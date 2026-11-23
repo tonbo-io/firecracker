@@ -828,24 +828,32 @@ impl GuestRegionMmapExt {
         // Linux guests inflate the traditional balloon at most 1 MiB at a time, so with
         // hugetlbfs, inflation frees nothing and can increase host memory use. Free page hinting
         // reports whole huge pages, and so does free page reporting by default.
-        let backing_page_size = RawGuestRegionMmap::page_size(self.inner.flags()) as u64;
+        let flags = self.inner.flags();
+        let file_offset = self.inner.file_offset();
+        let file_restore = file_offset.is_some() && flags & libc::MAP_PRIVATE != 0;
+        let mut backing_page_size = RawGuestRegionMmap::page_size(flags);
+        if file_restore {
+            // Replacing small pieces of a private snapshot mapping can exhaust the VMA limit.
+            // Remap only whole 2 MiB windows and zero the in-range edges in place. This bounds
+            // mapping splits by guest memory size, regardless of how often pages are discarded.
+            backing_page_size = backing_page_size.max(GUEST_MEMORY_ALIGNMENT);
+        }
+        let backing_page_size = backing_page_size as u64;
         let backing_aligned_start = align_up!(start, backing_page_size).min(end);
         let backing_aligned_end = align_down!(end, backing_page_size).max(backing_aligned_start);
         let backing_aligned_addr = MemoryRegionAddress(backing_aligned_start);
         let backing_aligned_len = u64_to_usize(backing_aligned_end - backing_aligned_start);
-        match (self.inner.file_offset(), self.inner.flags()) {
+        match file_offset {
             _ if backing_aligned_len == 0 => (),
-            // If and only if we are resuming from a snapshot file, we have a file and it's mapped
-            // private
-            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
+            Some(_) if file_restore => {
                 self.remap_anonymous_range(backing_aligned_addr, backing_aligned_len)?
             }
             // MADV_REMOVE frees the backing pages of a shared file mapping and, unlike fallocate,
             // sends UFFD_EVENT_REMOVE to a registered userfaultfd.
-            (Some(_), _) => {
+            Some(_) => {
                 self.madvise_range(backing_aligned_addr, backing_aligned_len, libc::MADV_REMOVE)?
             }
-            (None, _) => self.madvise_range(
+            None => self.madvise_range(
                 backing_aligned_addr,
                 backing_aligned_len,
                 libc::MADV_DONTNEED,
@@ -2543,6 +2551,56 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    #[test]
+    fn test_file_restore_remaps_only_whole_windows() {
+        let window = GUEST_MEMORY_ALIGNMENT;
+        let page = host_page_size();
+        let len = 3 * window;
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.write_all(&vec![2u8; len]).unwrap();
+        let mem = into_region_ext(
+            snapshot_file(
+                memory_file,
+                &[(GuestAddress(0), len)],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+
+        mem.discard_range(GuestAddress(page as u64), 2 * window)
+            .unwrap();
+        for (offset, expected) in [
+            (0, 2),
+            (page, 0),
+            (window, 0),
+            (2 * window, 0),
+            (2 * window + page, 2),
+        ] {
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(),
+                expected
+            );
+        }
+
+        // Drop the test's private copies. The edges still draw from the snapshot file,
+        // while the full window was remapped to anonymous zeroes.
+        let region = mem.iter().next().unwrap();
+        for (offset, expected) in [(page, 2), (window, 0), (2 * window, 2)] {
+            region
+                .madvise_range(
+                    MemoryRegionAddress(offset as u64),
+                    page,
+                    libc::MADV_DONTNEED,
+                )
+                .unwrap();
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
