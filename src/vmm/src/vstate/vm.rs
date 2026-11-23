@@ -684,6 +684,9 @@ impl KvmVm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
+        // Whether the file reads as zeros once its length is set: a new file, or one truncated
+        // below. Only then can a full snapshot leave its zero blocks as holes.
+        let mut reads_as_zeros = !file_existed;
         if file_existed {
             let file_size = file
                 .metadata()
@@ -700,6 +703,7 @@ impl KvmVm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
+                reads_as_zeros = true;
             }
         }
 
@@ -707,17 +711,26 @@ impl KvmVm {
         file.set_len(expected_size)
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
-        self.snapshot_memory_to_file(&mut file, snapshot_type, sync_snapshot_files)
+        self.snapshot_memory_to_file(
+            &mut file,
+            snapshot_type,
+            sync_snapshot_files,
+            reads_as_zeros,
+        )
     }
 
     /// Writes guest memory to `file` as a snapshot of `snapshot_type`, taking the dirty pages it
     /// covers, then flushes it and, if asked, syncs it. If any of that fails, the pages taken are
     /// marked dirty again.
+    ///
+    /// `reads_as_zeros` says that `file` reads as zeros over the whole memory area, so a full
+    /// snapshot may seek over the all-zero blocks instead of writing them.
     fn snapshot_memory_to_file<F: MemoryFile>(
         &self,
         file: &mut F,
         snapshot_type: SnapshotType,
         sync_snapshot_files: bool,
+        reads_as_zeros: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::{Memory, MemoryBackingFile};
 
@@ -731,6 +744,7 @@ impl KvmVm {
 
         match snapshot_type {
             SnapshotType::Diff => guest_memory.dump_dirty(file, &dirty_bitmap),
+            SnapshotType::Full if reads_as_zeros => guest_memory.dump_skipping_zeros(file),
             SnapshotType::Full => guest_memory.dump(file),
         }
         .map_err(Memory)
@@ -1022,13 +1036,13 @@ pub(crate) mod tests {
                     file: TempFile::new().unwrap().into_file(),
                     state: TestMemoryFileState::Fails(fails),
                 };
-                vm.snapshot_memory_to_file(&mut file, snapshot_type, true)
+                vm.snapshot_memory_to_file(&mut file, snapshot_type, true, false)
                     .unwrap_err();
                 assert!(is_dirty(), "{snapshot_type:?}: {fails} failed");
             }
 
             let mut file = TempFile::new().unwrap().into_file();
-            vm.snapshot_memory_to_file(&mut file, snapshot_type, true)
+            vm.snapshot_memory_to_file(&mut file, snapshot_type, true, false)
                 .unwrap();
             assert!(!is_dirty(), "{snapshot_type:?} succeeded");
         }
@@ -1063,7 +1077,7 @@ pub(crate) mod tests {
                     value: 2,
                 },
             };
-            vm.snapshot_memory_to_file(&mut racing_file, snapshot_type, false)
+            vm.snapshot_memory_to_file(&mut racing_file, snapshot_type, false, false)
                 .unwrap();
             file = racing_file.file;
             let is_dirty = vm
@@ -1073,7 +1087,7 @@ pub(crate) mod tests {
             assert!(is_dirty, "{snapshot_type:?}");
 
             file.rewind().unwrap();
-            vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, false)
+            vm.snapshot_memory_to_file(&mut file, SnapshotType::Diff, false, false)
                 .unwrap();
             let mut byte = [0];
             file.read_exact_at(&mut byte, page_size as u64).unwrap();
