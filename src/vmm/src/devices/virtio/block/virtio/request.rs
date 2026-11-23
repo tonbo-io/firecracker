@@ -559,6 +559,10 @@ impl Request {
                 writable.take(response, |_, _| Ok(()))?;
             }
         }
+        // The status is the last device-writable byte of the chain. Whatever a driver put
+        // between the data and it is neither read nor written.
+        let before_status = writable.remaining.saturating_sub(1);
+        writable.take(before_status, |_, _| Ok(()))?;
         // Capture the status byte from the writable stream, even if it shares a
         // descriptor with the preceding payload.
         writable.take(1, |addr, _| {
