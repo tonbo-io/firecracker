@@ -42,6 +42,18 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);
 /// A mask to extract mmap's flags related to HUGETLB
 const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HUGE_SHIFT);
+/// The block a sparse dump judges as a whole: seeked over when all zeros, written otherwise.
+const SPARSE_DUMP_BLOCK: usize = 4096;
+/// Bytes of guest memory a sparse dump copies out at a time to find its zero blocks.
+const SPARSE_DUMP_CHUNK: usize = 1 << 20;
+
+/// Whether every byte of `block` is zero.
+fn is_zero(block: &[u8]) -> bool {
+    // An OR over 64 bytes at a time vectorizes; the early exit is per 64 bytes.
+    block
+        .chunks(64)
+        .all(|bytes| bytes.iter().fold(0u8, |acc, byte| acc | byte) == 0)
+}
 
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -519,6 +531,60 @@ impl<'a> GuestMemorySlot<'a> {
         }
 
         Ok(())
+    }
+
+    /// Dumps this slot onto the writer, seeking over every all-zero block of
+    /// [`SPARSE_DUMP_BLOCK`] bytes instead of writing it, and leaves the cursor at the end of
+    /// the slot. Correct only when the writer's range for this slot already reads as zeros (a
+    /// file just truncated and extended), so that every block skipped reads back as zeros.
+    pub(crate) fn dump_skipping_zeros<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError> {
+        let len = self.slice.len();
+        let mut buffer = vec![0u8; SPARSE_DUMP_CHUNK.min(len)];
+        // The writer's position, relative to the start of the slot.
+        let mut position = 0;
+        // Where the run of data blocks being collected starts.
+        let mut data_from: Option<usize> = None;
+        let seek_to = |writer: &mut T, position: &mut usize, to: usize| {
+            if to > *position {
+                let gap =
+                    i64::try_from(to - *position).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                writer
+                    .seek(SeekFrom::Current(gap))
+                    .map_err(MemoryError::SeekError)?;
+                *position = to;
+            }
+            Ok::<(), MemoryError>(())
+        };
+        let mut offset = 0;
+        while offset < len {
+            let chunk_len = SPARSE_DUMP_CHUNK.min(len - offset);
+            let chunk = &mut buffer[..chunk_len];
+            self.slice.subslice(offset, chunk_len)?.copy_to(chunk);
+            for (index, block) in chunk.chunks(SPARSE_DUMP_BLOCK).enumerate() {
+                let at = offset + index * SPARSE_DUMP_BLOCK;
+                match (is_zero(block), data_from) {
+                    (true, Some(from)) => {
+                        writer.write_all_volatile(&self.slice.subslice(from, at - from)?)?;
+                        position = at;
+                        data_from = None;
+                    }
+                    (false, None) => {
+                        seek_to(writer, &mut position, at)?;
+                        data_from = Some(at);
+                    }
+                    _ => {}
+                }
+            }
+            offset += chunk_len;
+        }
+        if let Some(from) = data_from {
+            writer.write_all_volatile(&self.slice.subslice(from, len - from)?)?;
+            position = len;
+        }
+        seek_to(writer, &mut position, len)
     }
 
     /// Makes the slot host memory PROT_NONE (true) or PROT_READ|PROT_WRITE (false)
@@ -1169,6 +1235,13 @@ where
     /// Dumps all contents of GuestMemoryMmap to a writer.
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
 
+    /// Dumps all contents of GuestMemoryMmap to a writer that already reads as zeros, seeking
+    /// over the all-zero blocks instead of writing them.
+    fn dump_skipping_zeros<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError>;
+
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
         &self,
@@ -1270,6 +1343,28 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 Ok(())
             })
             .map_err(MemoryError::WriteMemory)
+    }
+
+    /// Dumps all contents of GuestMemoryMmap to a writer that already reads as zeros, seeking
+    /// over the all-zero blocks instead of writing them.
+    fn dump_skipping_zeros<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError> {
+        self.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if !plugged {
+                    let ilen = i64::try_from(mem_slot.slice.len())
+                        .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                    writer
+                        .seek(SeekFrom::Current(ilen))
+                        .map_err(MemoryError::SeekError)?;
+                    Ok(())
+                } else {
+                    mem_slot.dump_skipping_zeros(writer)
+                }
+            })
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -1888,6 +1983,65 @@ mod tests {
             .read(restored_region.as_mut_slice(), region_2_address)
             .unwrap();
         assert_eq!(second_region, restored_region);
+    }
+
+    #[test]
+    fn test_dump_skipping_zeros() {
+        let page_size = host_page_size();
+        let block = SPARSE_DUMP_BLOCK;
+
+        // Two regions with a one page gap between them, the first larger than a chunk.
+        let region_1_address = GuestAddress(0);
+        let region_1_size = SPARSE_DUMP_CHUNK + 4 * page_size;
+        let region_2_address = GuestAddress((region_1_size + page_size) as u64);
+        let region_2_size = page_size * 2;
+        let mem_regions = [
+            (region_1_address, region_1_size),
+            (region_2_address, region_2_size),
+        ];
+        let guest_memory =
+            into_region_ext(anonymous(&mem_regions, false, HugePageConfig::None).unwrap());
+
+        // Data at the start, across the chunk boundary, alone in the middle and in the last
+        // block of the first region; the second region is data from its second block on.
+        let data = [
+            (0, 2 * block),
+            (SPARSE_DUMP_CHUNK - block, 2 * block),
+            (SPARSE_DUMP_CHUNK + 3 * block, 1),
+            (region_1_size - block, block),
+        ];
+        for (at, len) in data {
+            guest_memory
+                .write(&vec![7u8; len], region_1_address.unchecked_add(at as u64))
+                .unwrap();
+        }
+        guest_memory
+            .write(
+                &vec![9u8; region_2_size - block],
+                region_2_address.unchecked_add(block as u64),
+            )
+            .unwrap();
+
+        let size = (region_1_size + region_2_size) as u64;
+        let mut full = TempFile::new().unwrap().into_file();
+        full.set_len(size).unwrap();
+        guest_memory.dump(&mut full).unwrap();
+        let mut sparse = TempFile::new().unwrap().into_file();
+        sparse.set_len(size).unwrap();
+        guest_memory.dump_skipping_zeros(&mut sparse).unwrap();
+
+        // The cursor ends where a full dump's does, and the bytes are the same.
+        assert_eq!(
+            sparse.stream_position().unwrap(),
+            full.stream_position().unwrap()
+        );
+        let mut full_bytes = Vec::new();
+        full.rewind().unwrap();
+        full.read_to_end(&mut full_bytes).unwrap();
+        let mut sparse_bytes = Vec::new();
+        sparse.rewind().unwrap();
+        sparse.read_to_end(&mut sparse_bytes).unwrap();
+        assert_eq!(full_bytes, sparse_bytes);
     }
 
     #[test]

@@ -631,6 +631,9 @@ impl KvmVm {
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
 
+        // Whether the file reads as zeros once its length is set: a new file, or one truncated
+        // below. Only then can a full snapshot leave its zero blocks as holes.
+        let mut reads_as_zeros = !file_existed;
         if file_existed {
             let file_size = file
                 .metadata()
@@ -647,6 +650,7 @@ impl KvmVm {
             if file_size != expected_size {
                 file.set_len(0)
                     .map_err(|err| MemoryBackingFile("truncate", err))?;
+                reads_as_zeros = true;
             }
         }
 
@@ -660,7 +664,11 @@ impl KvmVm {
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
-                self.guest_memory().dump(&mut file)?;
+                if reads_as_zeros {
+                    self.guest_memory().dump_skipping_zeros(&mut file)?;
+                } else {
+                    self.guest_memory().dump(&mut file)?;
+                }
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
