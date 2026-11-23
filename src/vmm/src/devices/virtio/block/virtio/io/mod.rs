@@ -31,6 +31,8 @@ pub enum BlockIoError {
     Sync(SyncIoError),
     /// Async error: {0}
     Async(AsyncIoError),
+    /// The async engine takes requests of one data segment only.
+    AsyncSegments,
 }
 
 impl BlockIoError {
@@ -136,6 +138,44 @@ impl FileEngine {
                 }),
             },
         }
+    }
+
+    /// Reads (`to_guest`) or writes `segments`, in order, at consecutive offsets from `offset`.
+    /// Only the sync engine, which advertises `VIRTIO_BLK_F_SEG_MAX`, takes more than one.
+    pub fn transfer_segments(
+        &mut self,
+        to_guest: bool,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        let FileEngine::Sync(engine) = self else {
+            return Err(RequestError {
+                req,
+                error: BlockIoError::AsyncSegments,
+            });
+        };
+        let mut done: u32 = 0;
+        for &(addr, len) in segments {
+            let at = offset + u64::from(done);
+            let res = if to_guest {
+                engine.read(at, mem, addr, len)
+            } else {
+                engine.write(at, mem, addr, len)
+            };
+            match res {
+                // `Request::parse` checked that the segments' sum does not overflow.
+                Ok(count) => done += count,
+                Err(err) => {
+                    return Err(RequestError {
+                        req,
+                        error: BlockIoError::Sync(err),
+                    });
+                }
+            }
+        }
+        Ok(FileEngineOk::Executed(RequestOk { req, count: done }))
     }
 
     pub fn flush(

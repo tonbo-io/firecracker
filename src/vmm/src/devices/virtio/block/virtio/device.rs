@@ -24,8 +24,8 @@ use vmm_sys_util::eventfd::EventFd;
 use super::io::async_io;
 use super::request::*;
 use super::{
-    BLOCK_QUEUE_SIZES, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE, VirtioBlockError,
-    io as block_io,
+    BLOCK_QUEUE_SIZES, BLOCK_REFILL_TIMER, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE, SEG_MAX,
+    VirtioBlockError, io as block_io,
 };
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
@@ -33,7 +33,7 @@ use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMe
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO,
-    VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_ID_BYTES,
+    VIRTIO_BLK_F_SEG_MAX, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_ID_BYTES,
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -293,6 +293,15 @@ impl Default for ConfigSpace {
     }
 }
 
+/// The `seg_max` the config space shows for `avail_features`.
+pub(crate) fn seg_max(avail_features: u64) -> u32 {
+    if avail_features & (1u64 << VIRTIO_BLK_F_SEG_MAX) != 0 {
+        SEG_MAX.to_le()
+    } else {
+        0
+    }
+}
+
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
 unsafe impl ByteValued for ConfigSpace {}
 
@@ -438,7 +447,8 @@ impl VirtioBlock {
         let rate_limiter = config
             .rate_limiter
             .map(RateLimiter::from)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .with_refill_timer(BLOCK_REFILL_TIMER);
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX)
@@ -455,9 +465,14 @@ impl VirtioBlock {
         if config.discard {
             avail_features |= 1u64 << VIRTIO_BLK_F_DISCARD;
         }
+        // Only the sync engine carries a request of several data segments.
+        if config.file_engine_type == FileEngineType::Sync {
+            avail_features |= 1u64 << VIRTIO_BLK_F_SEG_MAX;
+        }
 
         let mut config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            seg_max: seg_max(avail_features),
             ..Default::default()
         };
 
@@ -1019,10 +1034,13 @@ mod tests {
 
             assert_eq!(block.device_type(), VirtioDeviceType::Block);
 
-            let features: u64 = (1u64 << VIRTIO_F_VERSION_1)
+            let mut features: u64 = (1u64 << VIRTIO_F_VERSION_1)
                 | (1u64 << VIRTIO_RING_F_EVENT_IDX)
                 | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
                 | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
+            if engine == FileEngineType::Sync {
+                features |= 1u64 << VIRTIO_BLK_F_SEG_MAX;
+            }
 
             assert_eq!(
                 block.avail_features_by_page(0),
@@ -1170,6 +1188,7 @@ mod tests {
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
             let expected_config_space = ConfigSpace {
                 capacity: 8,
+                seg_max: if engine == FileEngineType::Sync { SEG_MAX } else { 0 },
                 ..Default::default()
             };
             assert_eq!(config, expected_config_space.as_slice());

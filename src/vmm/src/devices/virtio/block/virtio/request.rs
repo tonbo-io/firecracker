@@ -263,6 +263,9 @@ pub struct Request {
     pub status_addr: GuestAddress,
     sector: u64,
     data_addr: GuestAddress,
+    /// The data segments after the first, of an In or Out request (`VIRTIO_BLK_F_SEG_MAX`).
+    /// `data_len` counts every segment.
+    more_data: Vec<(GuestAddress, u32)>,
 }
 
 impl Request {
@@ -283,10 +286,11 @@ impl Request {
             data_addr: GuestAddress(0),
             data_len: 0,
             status_addr: GuestAddress(0),
+            more_data: Vec::new(),
         };
 
         let data_desc;
-        let status_desc;
+        let mut status_desc;
         let desc = avail_desc
             .next_descriptor()
             .ok_or(VirtioBlockError::DescriptorChainTooShort)?;
@@ -317,6 +321,27 @@ impl Request {
 
             req.data_addr = data_desc.addr;
             req.data_len = data_desc.len;
+
+            // Further data segments of a read or write, each in the first one's direction.
+            if req.r#type == RequestType::In || req.r#type == RequestType::Out {
+                while status_desc.has_next() {
+                    if status_desc.is_write_only() != data_desc.is_write_only() {
+                        return Err(if data_desc.is_write_only() {
+                            VirtioBlockError::UnexpectedReadOnlyDescriptor
+                        } else {
+                            VirtioBlockError::UnexpectedWriteOnlyDescriptor
+                        });
+                    }
+                    req.data_len = req
+                        .data_len
+                        .checked_add(status_desc.len)
+                        .ok_or(VirtioBlockError::InvalidDataLength)?;
+                    req.more_data.push((status_desc.addr, status_desc.len));
+                    status_desc = status_desc
+                        .next_descriptor()
+                        .ok_or(VirtioBlockError::DescriptorChainTooShort)?;
+                }
+            }
         }
 
         // check request validity
@@ -423,6 +448,11 @@ impl Request {
         self.sector << SECTOR_SHIFT
     }
 
+    fn more_data_len(&self) -> u32 {
+        // `parse` checked that the sum with the first segment does not overflow.
+        self.more_data.iter().map(|&(_, len)| len).sum()
+    }
+
     fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
         PendingRequest {
             r#type: self.r#type,
@@ -442,6 +472,22 @@ impl Request {
     ) -> ProcessingResult {
         let pending = self.to_pending_request(desc_idx);
         let res = match self.r#type {
+            RequestType::In | RequestType::Out if !self.more_data.is_empty() => {
+                let _metric = match self.r#type {
+                    RequestType::In => block_metrics.read_agg.record_latency_metrics(),
+                    _ => block_metrics.write_agg.record_latency_metrics(),
+                };
+                let mut segments = Vec::with_capacity(1 + self.more_data.len());
+                segments.push((self.data_addr, self.data_len - self.more_data_len()));
+                segments.extend_from_slice(&self.more_data);
+                disk.file_engine.transfer_segments(
+                    self.r#type == RequestType::In,
+                    self.offset(),
+                    mem,
+                    &segments,
+                    pending,
+                )
+            }
             RequestType::In => {
                 let _metric = block_metrics.read_agg.record_latency_metrics();
                 disk.file_engine
@@ -1010,6 +1056,7 @@ mod tests {
             status_addr,
             sector: sector & (NUM_DISK_SECTORS - sectors_len),
             data_addr,
+            more_data: Vec::new(),
         };
         let mut request_header = RequestHeader::new(virtio_request_id, request.sector);
 

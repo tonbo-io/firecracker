@@ -95,7 +95,8 @@ impl Persist<'_> for VirtioBlock {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let discard = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0;
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
-            .map_err(VirtioBlockError::RateLimiter)?;
+            .map_err(VirtioBlockError::RateLimiter)?
+            .with_refill_timer(BLOCK_REFILL_TIMER);
 
         let disk_properties = DiskProperties::new(
             state.disk_path.clone(),
@@ -124,6 +125,7 @@ impl Persist<'_> for VirtioBlock {
             blk_size: state.blk_size,
             topology: state.topology,
             discard_sector_alignment: state.discard_sector_alignment,
+            seg_max: device::seg_max(avail_features),
             ..Default::default()
         };
 

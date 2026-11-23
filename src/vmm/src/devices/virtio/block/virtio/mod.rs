@@ -27,6 +27,14 @@ pub const SECTOR_SIZE: u32 = (0x01_u32) << SECTOR_SHIFT;
 /// Keep this bounded so guest fstrim is split into predictable chunks instead
 /// of letting one large discard ioctl block the VMM thread for too long.
 pub const MAX_DISCARD_SECTORS: u32 = (128_u32 << 20) / SECTOR_SIZE;
+/// Data segments a request may carry on the sync engine (`seg_max`). A request takes `SEG_MAX`
+/// plus 2 (header and status) of the queue's 256 descriptors, as the ring has no indirect
+/// descriptors, so two requests of the most segments fit at once; at 4 KiB pages one request
+/// moves up to 512 KiB of scattered guest memory.
+pub const SEG_MAX: u32 = 128;
+/// How long a block device's rate limiter waits after a bucket runs dry, instead of the
+/// default 100 ms: a throttled request then waits about 10 ms past its tokens, not 100 ms.
+pub const BLOCK_REFILL_TIMER: std::time::Duration = std::time::Duration::from_millis(10);
 /// The number of queues of block device.
 pub const BLOCK_NUM_QUEUES: usize = 1;
 pub const BLOCK_QUEUE_SIZES: [u16; BLOCK_NUM_QUEUES] = [FIRECRACKER_MAX_QUEUE_SIZE];
