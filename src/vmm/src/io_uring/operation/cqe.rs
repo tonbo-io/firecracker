@@ -48,6 +48,11 @@ impl<T: Debug> Cqe<T> {
         }
     }
 
+    /// Consume the object and return the raw result and the user_data.
+    pub fn into_parts(self) -> (i32, T) {
+        (self.res, self.user_data)
+    }
+
     /// Consume the object and return the user_data.
     pub fn user_data(self) -> T {
         self.user_data

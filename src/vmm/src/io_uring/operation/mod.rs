@@ -34,6 +34,10 @@ pub enum OpCode {
     Fallocate = io_uring_op::IORING_OP_FALLOCATE as u8,
     /// Passthrough command to the file's driver.
     UringCmd = io_uring_op::IORING_OP_URING_CMD as u8,
+    /// Vectored read operation.
+    Readv = io_uring_op::IORING_OP_READV as u8,
+    /// Vectored write operation.
+    Writev = io_uring_op::IORING_OP_WRITEV as u8,
 }
 
 /// `IORING_OP_URING_CMD` command that discards a byte range of a block device,
@@ -48,6 +52,8 @@ impl From<OpCode> for &'static str {
             OpCode::Write => "write",
             OpCode::Fsync => "fsync",
             OpCode::Fallocate => "fallocate",
+            OpCode::Readv => "readv",
+            OpCode::Writev => "writev",
             OpCode::UringCmd => "uring_cmd",
         }
     }
@@ -116,6 +122,24 @@ impl<T: Debug> Operation<T> {
             offset: Some(offset),
             addr3: None,
             user_data,
+        }
+    }
+
+    /// Construct a vectored read operation: `iovecs` is the address of an array of `count`
+    /// `iovec`s, which the caller keeps valid and unchanged until the operation completes.
+    pub fn readv(fd: FixedFd, iovecs: usize, count: u32, offset: u64, user_data: T) -> Self {
+        Self {
+            opcode: OpCode::Readv,
+            ..Self::read(fd, iovecs, count, offset, user_data)
+        }
+    }
+
+    /// Construct a vectored write operation: `iovecs` is the address of an array of `count`
+    /// `iovec`s, which the caller keeps valid and unchanged until the operation completes.
+    pub fn writev(fd: FixedFd, iovecs: usize, count: u32, offset: u64, user_data: T) -> Self {
+        Self {
+            opcode: OpCode::Writev,
+            ..Self::write(fd, iovecs, count, offset, user_data)
         }
     }
 
