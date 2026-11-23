@@ -37,7 +37,13 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor "$BASE" HEAD
           [ -z "$(git rev-list --merges "$BASE..HEAD")" ]
+          # A commit is signed off. The exception is a commit ported from
+          # someone else's that had no sign-off: it names the original.
           for commit in $(git rev-list --reverse "$BASE..HEAD"); do
+            git log -1 --format=%B "$commit" | grep -Eq '^(Signed-off-by|Original-commit): ' \
+              || { echo "no Signed-off-by: $(git log -1 --format='%h %s' "$commit")" >&2; exit 1; }
+          done
+          for commit in $(git rev-list --reverse --author="$OURS" "$BASE..HEAD"); do
             git log -1 --format=%B "$commit" | grep -q '^Signed-off-by: ' \
               || { echo "no Signed-off-by: $(git log -1 --format='%h %s' "$commit")" >&2; exit 1; }
           done
