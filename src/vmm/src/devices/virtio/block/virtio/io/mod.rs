@@ -13,7 +13,82 @@ pub use self::format::{DiskImageFormat, VmdkFileEngine, VmdkIoError};
 pub use self::sync_io::{SyncFileEngine, SyncIoError};
 use crate::devices::virtio::block::virtio::PendingRequest;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
-use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
+use crate::utils::u64_to_usize;
+use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
+
+/// One data segment of a request: guest address and length.
+pub type DataSegment = (GuestAddress, u32);
+
+/// The most bytes a request of several data segments may carry: what Linux transfers in one
+/// read or write (`MAX_RW_COUNT` with 4 KiB pages). It also fits the signed result of an
+/// io_uring completion.
+pub const MAX_VECTORED_BYTES: u32 = 0x7fff_f000;
+
+/// The most `iovec`s one vectored system call or io_uring operation takes (`UIO_MAXIOV`).
+const MAX_IOVECS: usize = 1024;
+
+/// The host ranges of `segments`, in order and without the empty ones. Fails, before anything
+/// is transferred, if a segment is not inside one region of guest memory.
+fn segment_iovecs(
+    mem: &GuestMemoryMmap,
+    segments: &[DataSegment],
+) -> Result<Vec<libc::iovec>, vm_memory::GuestMemoryError> {
+    use vm_memory::GuestMemoryBackend;
+
+    segments
+        .iter()
+        .filter(|&&(_, len)| len != 0)
+        .map(|&(addr, len)| {
+            let len = u64_to_usize(u64::from(len));
+            let slice = mem.get_slice(addr, len)?;
+            Ok(libc::iovec {
+                iov_base: slice.ptr_guard_mut().as_ptr().cast(),
+                iov_len: len,
+            })
+        })
+        .collect()
+}
+
+/// Drops the first `done` bytes from the ranges of `iovecs`.
+fn advance_iovecs(iovecs: &mut Vec<libc::iovec>, mut done: usize) {
+    let mut whole = 0;
+    for iov in iovecs.iter_mut() {
+        if done < iov.iov_len {
+            iov.iov_base = iov.iov_base.cast::<u8>().wrapping_add(done).cast();
+            iov.iov_len -= done;
+            break;
+        }
+        done -= iov.iov_len;
+        whole += 1;
+    }
+    iovecs.drain(..whole);
+}
+
+/// Marks dirty `len` bytes of the data that `segments` describe in order, starting `from` bytes
+/// into it.
+fn mark_dirty_range(mem: &GuestMemoryMmap, segments: &[DataSegment], from: u32, len: u32) {
+    let mut skip = u64::from(from);
+    let mut left = u64::from(len);
+    for &(addr, segment_len) in segments {
+        if left == 0 {
+            break;
+        }
+        let segment_len = u64::from(segment_len);
+        if skip >= segment_len {
+            skip -= segment_len;
+            continue;
+        }
+        let count = (segment_len - skip).min(left);
+        mem.mark_dirty(GuestAddress(addr.0 + skip), u64_to_usize(count));
+        left -= count;
+        skip = 0;
+    }
+}
+
+/// The total length of `segments`.
+fn segments_len(segments: &[DataSegment]) -> u64 {
+    segments.iter().map(|&(_, len)| u64::from(len)).sum()
+}
 
 #[derive(Debug)]
 pub struct RequestOk {
@@ -35,9 +110,19 @@ pub enum BlockIoError {
     Async(AsyncIoError),
     /// VMDK error: {0}
     Vmdk(VmdkIoError),
+    /// A request of several data segments has a length that cannot be transferred: {0} bytes
+    VectoredLength(u64),
 }
 
 impl BlockIoError {
+    /// Bytes known to have been transferred before the error.
+    pub fn progress(&self) -> u32 {
+        match self {
+            BlockIoError::Sync(SyncIoError::Vectored(_, done)) => *done,
+            _ => 0,
+        }
+    }
+
     pub fn is_throttling_err(&self) -> bool {
         match self {
             BlockIoError::Async(AsyncIoError::IoUring(err)) => err.is_throttling_err(),
@@ -169,6 +254,97 @@ impl FileEngine {
                     error: BlockIoError::Vmdk(err),
                 }),
             },
+        }
+    }
+
+    /// Reads a request of several data segments: `count` bytes at `offset` into `segments`, in
+    /// order. Every segment is checked to be guest memory before anything is read.
+    pub fn readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<DataSegment>,
+        count: u32,
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        let total = segments_len(&segments);
+        if total != u64::from(count) || count > MAX_VECTORED_BYTES {
+            return Err(RequestError {
+                req,
+                error: BlockIoError::VectoredLength(total),
+            });
+        }
+        match self {
+            FileEngine::Async(engine) => match engine.push_readv(offset, mem, segments, req) {
+                Ok(_) => Ok(FileEngineOk::Submitted),
+                Err(err) => Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Async(err.error),
+                }),
+            },
+            FileEngine::Sync(engine) => match engine.readv(offset, mem, &segments) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Sync(err),
+                }),
+            },
+            FileEngine::Vmdk(engine) => {
+                // The image is read extent by extent anyway: one segment at a time.
+                let mut done: u32 = 0;
+                for &(addr, len) in &segments {
+                    match engine.read(offset + u64::from(done), mem, addr, len) {
+                        Ok(read) => done += read,
+                        Err(err) => {
+                            return Err(RequestError {
+                                req,
+                                error: BlockIoError::Vmdk(err),
+                            });
+                        }
+                    }
+                }
+                Ok(FileEngineOk::Executed(RequestOk { req, count: done }))
+            }
+        }
+    }
+
+    /// Writes a request of several data segments: `count` bytes from `segments`, in order, at
+    /// `offset`. Every segment is checked to be guest memory before anything is written.
+    pub fn writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<DataSegment>,
+        count: u32,
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        let total = segments_len(&segments);
+        if total != u64::from(count) || count > MAX_VECTORED_BYTES {
+            return Err(RequestError {
+                req,
+                error: BlockIoError::VectoredLength(total),
+            });
+        }
+        match self {
+            FileEngine::Async(engine) => match engine.push_writev(offset, mem, segments, req) {
+                Ok(_) => Ok(FileEngineOk::Submitted),
+                Err(err) => Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Async(err.error),
+                }),
+            },
+            FileEngine::Sync(engine) => match engine.writev(offset, mem, &segments) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Sync(err),
+                }),
+            },
+            // A VMDK image is read-only.
+            FileEngine::Vmdk(_) => Err(RequestError {
+                req,
+                error: BlockIoError::Vmdk(VmdkIoError::WriteNotSupported),
+            }),
         }
     }
 
@@ -627,5 +803,198 @@ pub mod tests {
             engine.update_file_path(File::open(descriptor).unwrap()),
             Err(BlockIoError::Vmdk(VmdkIoError::UnsupportedOperation))
         ));
+    }
+
+    fn create_mem_pages(pages: usize) -> GuestMemoryMmap {
+        GuestMemoryMmap::from_regions(
+            memory::anonymous(
+                &[(GuestAddress(0), pages * 4096)],
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|region| GuestRegionMmapExt::dram_from_mmap_region(region, 0))
+            .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_advance_iovecs() {
+        let mut buf = [0u8; 64];
+        let base = buf.as_mut_ptr();
+        let mut iovecs = vec![
+            libc::iovec {
+                iov_base: base.cast(),
+                iov_len: 16,
+            },
+            libc::iovec {
+                iov_base: base.wrapping_add(32).cast(),
+                iov_len: 16,
+            },
+        ];
+        // Nothing done changes nothing.
+        advance_iovecs(&mut iovecs, 0);
+        assert_eq!(iovecs.len(), 2);
+        // The whole first range and part of the second.
+        advance_iovecs(&mut iovecs, 20);
+        assert_eq!(iovecs.len(), 1);
+        assert_eq!(iovecs[0].iov_base, base.wrapping_add(36).cast());
+        assert_eq!(iovecs[0].iov_len, 12);
+        // More than is left empties it.
+        advance_iovecs(&mut iovecs, 100);
+        assert!(iovecs.is_empty());
+    }
+
+    #[test]
+    fn test_mark_dirty_range() {
+        let mem = create_mem_pages(4);
+        let segments = [
+            (GuestAddress(0), 512),
+            (GuestAddress(4096), 512),
+            (GuestAddress(2 * 4096), 512),
+            (GuestAddress(3 * 4096), 512),
+        ];
+        // Bytes 600..1100 of the data are in the second and third segments only.
+        mark_dirty_range(&mem, &segments, 600, 500);
+        check_clean_mem(&mem, GuestAddress(0), 512);
+        check_dirty_mem(&mem, GuestAddress(4096), 512);
+        check_dirty_mem(&mem, GuestAddress(2 * 4096), 512);
+        check_clean_mem(&mem, GuestAddress(3 * 4096), 512);
+        // Nothing, and a range past the end of the segments, mark nothing more.
+        mark_dirty_range(&mem, &segments, 0, 0);
+        mark_dirty_range(&mem, &segments, 2048, 512);
+        check_clean_mem(&mem, GuestAddress(0), 512);
+        check_clean_mem(&mem, GuestAddress(3 * 4096), 512);
+    }
+
+    // A file that ends inside a request of several segments: both engines stop at its end,
+    // report the bytes read and mark dirty the pages those went to and no other.
+    #[test]
+    fn test_vectored_read_past_end_of_file() {
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let mem = create_mem_pages(3);
+            let file = TempFile::new().unwrap().into_file();
+            file.write_all_at(&[0x5a; 768], 0).unwrap();
+            let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+            let segments = vec![
+                (GuestAddress(0), 512),
+                (GuestAddress(4096), 512),
+                (GuestAddress(2 * 4096), 512),
+            ];
+            let res = engine.readv(0, &mem, segments, 1536, PendingRequest::default());
+            match &mut engine {
+                FileEngine::Async(engine) => {
+                    assert_queued!(res);
+                    engine.drain(false).unwrap();
+                    // Fewer bytes than the request has: the device fails such a request.
+                    assert_eq!(engine.pop(&mem).unwrap().unwrap().result().unwrap(), 768);
+                    assert!(!engine.has_pending_ops());
+                }
+                _ => {
+                    let err = res.unwrap_err();
+                    assert!(matches!(
+                        err.error,
+                        BlockIoError::Sync(SyncIoError::Vectored(_, 768))
+                    ));
+                    assert_eq!(err.error.progress(), 768);
+                }
+            }
+            let mut read = [0u8; 256];
+            mem.read_slice(&mut read, GuestAddress(4096)).unwrap();
+            assert_eq!(read, [0x5a; 256]);
+            check_dirty_mem(&mem, GuestAddress(0), 512);
+            check_dirty_mem(&mem, GuestAddress(4096), 256);
+            check_clean_mem(&mem, GuestAddress(2 * 4096), 512);
+        }
+    }
+
+    // A segment that is not guest memory, in the middle of a request: the request is refused
+    // before anything is transferred, so a write leaves the file as it was and a read leaves
+    // the other segments untouched and clean.
+    #[test]
+    fn test_vectored_refused_before_any_io() {
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            for bad in [
+                // Outside guest memory.
+                (GuestAddress(3 * 4096), 512),
+                // Starts inside it and runs past its end.
+                (GuestAddress(3 * 4096 - 256), 512),
+            ] {
+                let mem = create_mem_pages(3);
+                mem.write_slice(&[0x11; 512], GuestAddress(0)).unwrap();
+                mem.reset_dirty();
+                let file = TempFile::new().unwrap().into_file();
+                file.write_all_at(&[0x22; 1536], 0).unwrap();
+                let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+                let segments = vec![(GuestAddress(0), 512), bad, (GuestAddress(4096), 512)];
+
+                let err = engine
+                    .writev(0, &mem, segments.clone(), 1536, PendingRequest::default())
+                    .unwrap_err();
+                assert!(matches!(
+                    err.error,
+                    BlockIoError::Sync(SyncIoError::Transfer(_))
+                        | BlockIoError::Async(AsyncIoError::GuestMemory(_))
+                ));
+                let mut on_disk = [0u8; 1536];
+                engine.file().read_exact_at(&mut on_disk, 0).unwrap();
+                assert_eq!(on_disk, [0x22; 1536]);
+
+                let err = engine
+                    .readv(0, &mem, segments, 1536, PendingRequest::default())
+                    .unwrap_err();
+                assert_eq!(err.error.progress(), 0);
+                let mut first = [0u8; 512];
+                mem.read_slice(&mut first, GuestAddress(0)).unwrap();
+                assert_eq!(first, [0x11; 512]);
+                check_clean_mem(&mem, GuestAddress(0), 512);
+                check_clean_mem(&mem, GuestAddress(4096), 512);
+
+                if let FileEngine::Async(engine) = &engine {
+                    assert!(!engine.has_pending_ops());
+                }
+            }
+        }
+    }
+
+    // A request longer than one transfer moves, or whose length is not its segments', is
+    // refused before its segments are looked at.
+    #[test]
+    fn test_vectored_length_limit() {
+        for engine_type in [FileEngineType::Sync, FileEngineType::Async] {
+            let mem = create_mem_pages(2);
+            let file = TempFile::new().unwrap().into_file();
+            let mut engine = FileEngine::from_file(file, engine_type, false).unwrap();
+
+            let too_long = vec![(GuestAddress(0), 0x4000_0000); 2];
+            let err = engine
+                .writev(
+                    0,
+                    &mem,
+                    too_long.clone(),
+                    0x8000_0000,
+                    PendingRequest::default(),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                err.error,
+                BlockIoError::VectoredLength(0x8000_0000)
+            ));
+            let err = engine
+                .readv(0, &mem, too_long, 0x8000_0000, PendingRequest::default())
+                .unwrap_err();
+            assert!(matches!(
+                err.error,
+                BlockIoError::VectoredLength(0x8000_0000)
+            ));
+
+            let segments = vec![(GuestAddress(0), 512), (GuestAddress(4096), 512)];
+            let err = engine
+                .readv(0, &mem, segments, 512, PendingRequest::default())
+                .unwrap_err();
+            assert!(matches!(err.error, BlockIoError::VectoredLength(1024)));
+        }
     }
 }

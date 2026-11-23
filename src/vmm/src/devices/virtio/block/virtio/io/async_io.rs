@@ -1,6 +1,7 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fs::File;
 use std::os::fd::RawFd;
@@ -11,13 +12,15 @@ use vm_memory::{GuestMemoryBackend, GuestMemoryError};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::arch::host_kernel_version;
-use crate::devices::virtio::block::virtio::io::RequestError;
+use crate::devices::virtio::block::virtio::io::{
+    DataSegment, MAX_IOVECS, RequestError, advance_iovecs, mark_dirty_range, segment_iovecs,
+};
 use crate::devices::virtio::block::virtio::{IO_URING_NUM_ENTRIES, PendingRequest};
 use crate::io_uring::operation::{Cqe, OpCode, Operation};
 use crate::io_uring::restriction::Restriction;
 use crate::io_uring::{IoUring, IoUringError};
 use crate::logger::log_dev_preview_warning;
-use crate::utils::Version;
+use crate::utils::{Version, u64_to_usize};
 use crate::vstate::memory::{GuestAddress, GuestMemoryExtension, GuestMemoryMmap};
 
 /// `BLOCK_URING_CMD_DISCARD` was added in Linux 6.12. Probing `IORING_OP_URING_CMD` is not
@@ -55,6 +58,10 @@ pub struct AsyncFileEngine {
     completion_evt: EventFd,
     discard: bool,
     discard_op: Option<DiscardOp>,
+    /// Multi-segment transfers that came back short and wait to be issued again for the rest.
+    continuations: VecDeque<WrappedRequest>,
+    /// Completions taken off the ring and not handed to the device yet.
+    ready: VecDeque<Cqe<WrappedRequest>>,
 }
 
 /// How discard is executed for the backing file.
@@ -97,17 +104,65 @@ impl DiscardOp {
 pub struct WrappedRequest {
     addr: Option<GuestAddress>,
     req: PendingRequest,
+    vectored: Option<Vectored>,
 }
+
+/// What is left of the transfer of a request of several data segments. One operation is issued
+/// for all of it; if that completes short, another is issued for the rest, until an operation
+/// transfers nothing or fails.
+#[derive(Debug)]
+struct Vectored {
+    write: bool,
+    /// The file offset of the request's first byte.
+    offset: u64,
+    /// The guest memory the request's segments are in, kept mapped until the last completion.
+    mem: GuestMemoryMmap,
+    /// The request's guest ranges, in order, for marking what a read wrote; empty for a write.
+    segments: Vec<DataSegment>,
+    /// The host ranges not transferred yet. The operation in flight was given this array, so
+    /// it changes only between a completion and the next submission.
+    iovecs: Vec<libc::iovec>,
+    /// Bytes transferred so far.
+    done: u32,
+}
+
+// SAFETY: The pointers in `iovecs` point into the guest memory that `mem` keeps mapped, which
+// may be accessed from any thread, as the single-segment operations' buffers are.
+unsafe impl Send for Vectored {}
 
 impl WrappedRequest {
     fn new(req: PendingRequest) -> Self {
-        WrappedRequest { addr: None, req }
+        WrappedRequest {
+            addr: None,
+            req,
+            vectored: None,
+        }
     }
 
     fn new_with_dirty_tracking(addr: GuestAddress, req: PendingRequest) -> Self {
         WrappedRequest {
             addr: Some(addr),
             req,
+            vectored: None,
+        }
+    }
+
+    /// The operation that transfers what is left of a multi-segment request.
+    fn vectored_operation(self) -> Operation<Self> {
+        let (write, iovecs, count, offset) = match &self.vectored {
+            Some(vectored) => (
+                vectored.write,
+                vectored.iovecs.as_ptr() as usize,
+                u32::try_from(vectored.iovecs.len().min(MAX_IOVECS))
+                    .expect("MAX_IOVECS fits a u32"),
+                vectored.offset.saturating_add(u64::from(vectored.done)),
+            ),
+            None => (false, 0, 0, 0),
+        };
+        if write {
+            Operation::writev(0, iovecs, count, offset, self)
+        } else {
+            Operation::readv(0, iovecs, count, offset, self)
         }
     }
 
@@ -133,8 +188,11 @@ impl AsyncFileEngine {
             Restriction::AllowOpCode(OpCode::Read),
             Restriction::AllowOpCode(OpCode::Write),
             Restriction::AllowOpCode(OpCode::Fsync),
+            // A request of several data segments.
+            Restriction::AllowOpCode(OpCode::Readv),
+            Restriction::AllowOpCode(OpCode::Writev),
         ];
-        let mut extra_ops = Vec::new();
+        let mut extra_ops = vec![OpCode::Readv, OpCode::Writev];
         match discard_op {
             Some(DiscardOp::Fallocate) => {
                 restrictions.push(Restriction::AllowOpCode(OpCode::Fallocate));
@@ -172,6 +230,8 @@ impl AsyncFileEngine {
             completion_evt,
             discard,
             discard_op,
+            continuations: VecDeque::new(),
+            ready: VecDeque::new(),
         })
     }
 
@@ -266,6 +326,67 @@ impl AsyncFileEngine {
             })
     }
 
+    /// Queues the read of a request of several data segments, as one `IORING_OP_READV`.
+    pub fn push_readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<DataSegment>,
+        req: PendingRequest,
+    ) -> Result<(), RequestError<AsyncIoError>> {
+        self.push_vectored(offset, mem, segments, false, req)
+    }
+
+    /// Queues the write of a request of several data segments, as one `IORING_OP_WRITEV`.
+    pub fn push_writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<DataSegment>,
+        req: PendingRequest,
+    ) -> Result<(), RequestError<AsyncIoError>> {
+        self.push_vectored(offset, mem, segments, true, req)
+    }
+
+    fn push_vectored(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: Vec<DataSegment>,
+        write: bool,
+        req: PendingRequest,
+    ) -> Result<(), RequestError<AsyncIoError>> {
+        // Every segment is resolved before anything is queued.
+        let iovecs = match segment_iovecs(mem, &segments) {
+            Ok(iovecs) => iovecs,
+            Err(err) => {
+                return Err(RequestError {
+                    req,
+                    error: AsyncIoError::GuestMemory(err),
+                });
+            }
+        };
+        let wrapped = WrappedRequest {
+            addr: None,
+            req,
+            vectored: Some(Vectored {
+                write,
+                offset,
+                mem: mem.clone(),
+                segments: if write { Vec::new() } else { segments },
+                iovecs,
+                done: 0,
+            }),
+        };
+
+        self.ring
+            .push(wrapped.vectored_operation())
+            .map_err(|(io_uring_error, data)| RequestError {
+                req: data.req,
+                error: AsyncIoError::IoUring(io_uring_error),
+            })
+    }
+
     pub fn push_flush(&mut self, req: PendingRequest) -> Result<(), RequestError<AsyncIoError>> {
         let wrapped_user_data = WrappedRequest::new(req);
 
@@ -318,21 +439,38 @@ impl AsyncFileEngine {
             .map_err(AsyncIoError::IoUring)
     }
 
+    /// Whether a request is queued, in flight, or completed and not handed to the device yet.
     pub(crate) fn has_pending_ops(&self) -> bool {
-        self.ring.num_ops() != 0
+        self.ring.num_ops() != 0 || !self.continuations.is_empty() || !self.ready.is_empty()
     }
 
+    /// Waits until every request has completed. A multi-segment request whose operation came
+    /// back short is issued again for the rest, and waited for, unless `discard_cqes`: then the
+    /// completions are dropped, and with them every request, as nobody will read them.
     pub fn drain(&mut self, discard_cqes: bool) -> Result<(), AsyncIoError> {
-        self.ring
-            .submit_and_wait_all()
-            .map_err(AsyncIoError::IoUring)?;
-
         if discard_cqes {
+            // Nothing in flight uses a queued continuation's ranges, so it can be dropped.
+            self.continuations.clear();
+            self.ring
+                .submit_and_wait_all()
+                .map_err(AsyncIoError::IoUring)?;
             // Drain the completion queue so that we may deallocate the user_data fields.
             while self.do_pop()?.is_some() {}
+            self.ready.clear();
+            return Ok(());
         }
 
-        Ok(())
+        loop {
+            self.push_continuations()?;
+            self.ring
+                .submit_and_wait_all()
+                .map_err(AsyncIoError::IoUring)?;
+            // Every operation has completed; one that was short leaves a continuation.
+            self.harvest()?;
+            if self.ring.num_ops() == 0 && self.continuations.is_empty() {
+                return Ok(());
+            }
+        }
     }
 
     pub fn drain_and_flush(&mut self, discard_cqes: bool) -> Result<(), AsyncIoError> {
@@ -350,11 +488,67 @@ impl AsyncFileEngine {
         self.ring.pop().map_err(AsyncIoError::IoUring)
     }
 
+    /// Issues the queued continuations of short multi-segment transfers, and submits them.
+    ///
+    /// A continuation takes the place of the operation whose completion left it, so the ring
+    /// has room for it; should the ring be full all the same, it stays queued until the next
+    /// completion is taken off the ring.
+    fn push_continuations(&mut self) -> Result<(), AsyncIoError> {
+        if self.continuations.is_empty() {
+            return Ok(());
+        }
+        while let Some(wrapped) = self.continuations.pop_front() {
+            if let Err((err, wrapped)) = self.ring.push(wrapped.vectored_operation()) {
+                self.continuations.push_front(wrapped);
+                if err.is_throttling_err() {
+                    break;
+                }
+                return Err(AsyncIoError::IoUring(err));
+            }
+        }
+        self.kick_submission_queue()
+    }
+
+    /// Takes every completion off the ring. A multi-segment transfer that came back short is
+    /// issued again for the rest; every other completion is kept for [`Self::pop`].
+    fn harvest(&mut self) -> Result<(), AsyncIoError> {
+        while let Some(cqe) = self.do_pop()? {
+            let (res, mut wrapped) = cqe.into_parts();
+            let Some(vectored) = wrapped.vectored.as_mut() else {
+                self.ready.push_back(Cqe::new(res, wrapped));
+                continue;
+            };
+            // A failed operation transferred nothing: what the earlier ones of this request
+            // read is already marked dirty, and the request fails as a whole.
+            let Ok(moved) = u32::try_from(res) else {
+                self.ready.push_back(Cqe::new(res, wrapped));
+                continue;
+            };
+            if !vectored.write {
+                // Exactly what this operation read, which starts where the last one stopped.
+                mark_dirty_range(&vectored.mem, &vectored.segments, vectored.done, moved);
+            }
+            vectored.done = vectored.done.saturating_add(moved);
+            advance_iovecs(&mut vectored.iovecs, u64_to_usize(u64::from(moved)));
+            if moved == 0 || vectored.iovecs.is_empty() {
+                // All of it, or as much as there is (an operation that transfers nothing has
+                // reached the end of the file): the request completes with the bytes
+                // transferred, and the device fails it if they are not all of them.
+                let done = i32::try_from(vectored.done).unwrap_or(i32::MAX);
+                self.ready.push_back(Cqe::new(done, wrapped));
+            } else {
+                self.continuations.push_back(wrapped);
+            }
+        }
+        self.push_continuations()
+    }
+
     pub fn pop(
         &mut self,
         mem: &GuestMemoryMmap,
     ) -> Result<Option<Cqe<PendingRequest>>, AsyncIoError> {
-        let cqe = self.do_pop()?.map(|cqe| {
+        self.harvest()?;
+        let cqe = self.ready.pop_front().map(|cqe| {
             let count = cqe.count();
             cqe.map_user_data(|wrapped_user_data| {
                 wrapped_user_data.mark_dirty_mem_and_unwrap(mem, count)
