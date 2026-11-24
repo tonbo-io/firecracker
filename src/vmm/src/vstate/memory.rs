@@ -11,6 +11,7 @@ use std::io;
 use std::io::{Seek, SeekFrom};
 use std::ops::{Deref, Range};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
@@ -46,6 +47,60 @@ const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HU
 const SPARSE_DUMP_BLOCK: usize = 4096;
 /// Bytes of guest memory a sparse dump copies out at a time to find its zero blocks.
 const SPARSE_DUMP_CHUNK: usize = 1 << 20;
+/// How many memory mappings the discards of pieces smaller than a 2 MiB window may add to the
+/// process after a restore from a privately mapped memory file, over all its regions: a tenth of
+/// the 262144 mappings (`vm.max_map_count`) that hosts running many VMs commonly allow. Beyond
+/// it, such pieces are zeroed in place, which keeps the number of mappings where it is.
+const SMALL_DISCARD_MAPPING_BUDGET: usize = 262_144 / 10;
+
+/// The process's budget of [`SMALL_DISCARD_MAPPING_BUDGET`] mappings.
+static SMALL_DISCARD_MAPPINGS: MappingBudget = MappingBudget::new(SMALL_DISCARD_MAPPING_BUDGET);
+
+/// A number of memory mappings that may still be added to the process. Mappings are charged
+/// before they are made and never given back, so the charge is an upper bound of the mappings
+/// added, whatever the kernel merges.
+#[derive(Debug)]
+pub(crate) struct MappingBudget {
+    limit: usize,
+    used: AtomicUsize,
+    spent: AtomicBool,
+}
+
+impl MappingBudget {
+    pub(crate) const fn new(limit: usize) -> Self {
+        MappingBudget {
+            limit,
+            used: AtomicUsize::new(0),
+            spent: AtomicBool::new(false),
+        }
+    }
+
+    /// Charges `mappings` when they fit in what is left, and says whether they did. The first
+    /// refusal is logged.
+    pub(crate) fn try_charge(&self, mappings: usize) -> bool {
+        let charged = self
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(mappings)
+                    .filter(|&total| total <= self.limit)
+            })
+            .is_ok();
+        if !charged && !self.spent.swap(true, Ordering::Relaxed) {
+            warn_unrestricted!(
+                "discard_range: the budget of {} mappings for small discards is spent; they are \
+                 zeroed in place from now on",
+                self.limit
+            );
+        }
+        charged
+    }
+
+    /// The mappings charged so far.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
 
 /// Whether every byte of `block` is zero.
 fn is_zero(block: &[u8]) -> bool {
@@ -418,6 +473,10 @@ pub struct GuestRegionMmapExt {
     slot_size: usize,
     /// a bitvec indicating whether slot `i` is plugged into KVM (1) or not (0)
     pub plugged: Mutex<BitVec>,
+    /// After a restore from a privately mapped memory file, whether host page `i` of the region
+    /// was remapped as anonymous memory by a discard (1) or still maps the file (0). Empty until
+    /// the first such discard.
+    anonymous: Mutex<BitVec>,
 }
 
 /// A guest memory slot, which is a slice of a guest memory region
@@ -613,6 +672,7 @@ impl GuestRegionMmapExt {
             slot_from: slot,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(true, 1)),
+            anonymous: Mutex::new(BitVec::new()),
         }
     }
 
@@ -634,6 +694,7 @@ impl GuestRegionMmapExt {
             slot_from,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(false, slot_cnt)),
+            anonymous: Mutex::new(BitVec::new()),
         }
     }
 
@@ -660,6 +721,7 @@ impl GuestRegionMmapExt {
             region_type: state.region_type,
             slot_from,
             plugged: Mutex::new(BitVec::from_iter(state.plugged.iter())),
+            anonymous: Mutex::new(BitVec::new()),
         })
     }
 
@@ -809,6 +871,17 @@ impl GuestRegionMmapExt {
         caddr: MemoryRegionAddress,
         len: usize,
     ) -> Result<(), GuestMemoryError> {
+        self.discard_range_within(caddr, len, &SMALL_DISCARD_MAPPINGS)
+    }
+
+    /// [`Self::discard_range`], charging the mappings that discards of pieces smaller than a
+    /// 2 MiB window add after a file-backed restore to `budget`.
+    fn discard_range_within(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+        budget: &MappingBudget,
+    ) -> Result<(), GuestMemoryError> {
         // The address and length can come straight from a guest descriptor (balloon), so reject
         // ranges that are not host page aligned or that run past the end of the region.
         let page_size = host_page_size() as u64;
@@ -832,10 +905,14 @@ impl GuestRegionMmapExt {
         let file_offset = self.inner.file_offset();
         let file_restore = file_offset.is_some() && flags & libc::MAP_PRIVATE != 0;
         let mut backing_page_size = RawGuestRegionMmap::page_size(flags);
+        // Pieces of a private snapshot mapping smaller than a window can be remapped one by one
+        // only when it is mapped with host pages.
+        let small_remaps = file_restore && backing_page_size == host_page_size();
         if file_restore {
             // Replacing small pieces of a private snapshot mapping can exhaust the VMA limit.
-            // Remap only whole 2 MiB windows and zero the in-range edges in place. This bounds
-            // mapping splits by guest memory size, regardless of how often pages are discarded.
+            // Remap whole 2 MiB windows, which bounds their mapping splits by guest memory size,
+            // regardless of how often pages are discarded. The edges are remapped too while
+            // `budget` lasts, and zeroed in place after.
             backing_page_size = backing_page_size.max(GUEST_MEMORY_ALIGNMENT);
         }
         let backing_page_size = backing_page_size as u64;
@@ -843,10 +920,19 @@ impl GuestRegionMmapExt {
         let backing_aligned_end = align_down!(end, backing_page_size).max(backing_aligned_start);
         let backing_aligned_addr = MemoryRegionAddress(backing_aligned_start);
         let backing_aligned_len = u64_to_usize(backing_aligned_end - backing_aligned_start);
+        let mut anonymous = small_remaps.then(|| self.anonymous.lock().unwrap());
+        if let Some(anonymous) = anonymous.as_mut() {
+            anonymous.resize(u64_to_usize(self.len() / page_size), false);
+        }
         match file_offset {
             _ if backing_aligned_len == 0 => (),
             Some(_) if file_restore => {
-                self.remap_anonymous_range(backing_aligned_addr, backing_aligned_len)?
+                self.remap_anonymous_range(backing_aligned_addr, backing_aligned_len)?;
+                if let Some(anonymous) = anonymous.as_mut() {
+                    anonymous[u64_to_usize(backing_aligned_start / page_size)
+                        ..u64_to_usize(backing_aligned_end / page_size)]
+                        .fill(true);
+                }
             }
             // MADV_REMOVE frees the backing pages of a shared file mapping and, unlike fallocate,
             // sends UFFD_EVENT_REMOVE to a registered userfaultfd.
@@ -867,11 +953,71 @@ impl GuestRegionMmapExt {
             if edge_len == 0 || self.check_range_plugged(edge_addr, edge_len).is_err() {
                 continue;
             }
-            let edge = self.get_slice(edge_addr, edge_len)?;
-            // SAFETY: `get_slice` bounds `edge` within this region's mapping,
-            // and plugged memory is writable.
-            unsafe { std::ptr::write_bytes(edge.ptr_guard_mut().as_ptr(), 0, edge.len()) };
+            match anonymous.as_mut() {
+                Some(anonymous) => {
+                    self.discard_small_piece(anonymous, edge_start, edge_end, budget)?
+                }
+                None => self.zero_in_place(edge_addr, edge_len)?,
+            }
         }
+        Ok(())
+    }
+
+    /// Discards the plugged pages `[start, end)` of a private snapshot mapping, all within one
+    /// 2 MiB window. Runs of pages an earlier discard remapped are anonymous already, so they are
+    /// freed with `MADV_DONTNEED` and add no mapping. A run that still maps the file is remapped
+    /// as anonymous memory when `budget` takes the two mappings per slot that the remap may add
+    /// (the new mapping and the split of the one it lands in), and zeroed in place otherwise.
+    fn discard_small_piece(
+        &self,
+        anonymous: &mut BitVec,
+        start: u64,
+        end: u64,
+        budget: &MappingBudget,
+    ) -> Result<(), GuestMemoryError> {
+        let page_size = host_page_size() as u64;
+        let last = u64_to_usize(end / page_size);
+        let mut page = u64_to_usize(start / page_size);
+        while page < last {
+            let remapped = anonymous[page];
+            let run = anonymous[page..last]
+                .iter()
+                .by_vals()
+                .take_while(|&bit| bit == remapped)
+                .count();
+            let addr = MemoryRegionAddress(page as u64 * page_size);
+            let len = run * host_page_size();
+            if remapped {
+                self.madvise_range(addr, len, libc::MADV_DONTNEED)?;
+            } else {
+                let slots = self
+                    .slots_intersecting_range(
+                        self.start_addr().unchecked_add(addr.raw_value()),
+                        len,
+                    )
+                    .count();
+                if budget.try_charge(2 * slots) {
+                    self.remap_anonymous_range(addr, len)?;
+                    anonymous[page..page + run].fill(true);
+                } else {
+                    self.zero_in_place(addr, len)?;
+                }
+            }
+            page += run;
+        }
+        Ok(())
+    }
+
+    /// Writes zeros over the plugged range `[caddr, caddr + len)`, which keeps its mapping.
+    fn zero_in_place(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        let range = self.get_slice(caddr, len)?;
+        // SAFETY: `get_slice` bounds `range` within this region's mapping,
+        // and plugged memory is writable.
+        unsafe { std::ptr::write_bytes(range.ptr_guard_mut().as_ptr(), 0, range.len()) };
         Ok(())
     }
 
@@ -2553,14 +2699,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_restore_remaps_only_whole_windows() {
-        let window = GUEST_MEMORY_ALIGNMENT;
-        let page = host_page_size();
-        let len = 3 * window;
+    /// Guest memory of `len` bytes at guest address 0, restored from a memory file of 2s.
+    fn file_restored(len: usize) -> GuestMemoryMmap {
         let mut memory_file = TempFile::new().unwrap().into_file();
         memory_file.write_all(&vec![2u8; len]).unwrap();
-        let mem = into_region_ext(
+        into_region_ext(
             snapshot_file(
                 memory_file,
                 &[(GuestAddress(0), len)],
@@ -2568,9 +2711,64 @@ mod tests {
                 HugePageConfig::None,
             )
             .unwrap(),
-        );
+        )
+    }
 
-        mem.discard_range(GuestAddress(page as u64), 2 * window)
+    /// What the page at `offset` reads after its private copy is dropped: 0 when it is
+    /// anonymous, the memory file's byte when it still maps the file.
+    fn backing_of(mem: &GuestMemoryMmap, offset: usize) -> u8 {
+        mem.iter()
+            .next()
+            .unwrap()
+            .madvise_range(
+                MemoryRegionAddress(offset as u64),
+                host_page_size(),
+                libc::MADV_DONTNEED,
+            )
+            .unwrap();
+        mem.read_obj::<u8>(GuestAddress(offset as u64)).unwrap()
+    }
+
+    /// The process's mappings that overlap the region's host memory.
+    fn mappings_of(mem: &GuestMemoryMmap) -> usize {
+        let region = mem.iter().next().unwrap();
+        let from = region.as_ptr() as usize;
+        let to = from + u64_to_usize(region.len());
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let (start, end) = line.split_once(' ').unwrap().0.split_once('-').unwrap();
+                let start = usize::from_str_radix(start, 16).unwrap();
+                let end = usize::from_str_radix(end, 16).unwrap();
+                start < to && from < end
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_mapping_budget_charges_up_to_its_limit() {
+        let budget = MappingBudget::new(5);
+        assert!(budget.try_charge(2));
+        assert!(budget.try_charge(2));
+        // A charge that does not fit takes nothing.
+        assert!(!budget.try_charge(2));
+        assert_eq!(budget.used(), 4);
+        assert!(budget.try_charge(1));
+        assert!(!budget.try_charge(1));
+        assert_eq!(budget.used(), 5);
+    }
+
+    #[test]
+    fn test_file_restore_zeroes_edges_once_the_budget_is_spent() {
+        let window = GUEST_MEMORY_ALIGNMENT;
+        let page = host_page_size();
+        let mem = file_restored(3 * window);
+        let region = mem.iter().next().unwrap();
+        let spent = MappingBudget::new(0);
+
+        region
+            .discard_range_within(MemoryRegionAddress(page as u64), 2 * window, &spent)
             .unwrap();
         for (offset, expected) in [
             (0, 2),
@@ -2585,22 +2783,87 @@ mod tests {
             );
         }
 
-        // Drop the test's private copies. The edges still draw from the snapshot file,
-        // while the full window was remapped to anonymous zeroes.
-        let region = mem.iter().next().unwrap();
+        // The edges were zeroed in place and still draw from the snapshot file, while the full
+        // window was remapped to anonymous zeroes.
         for (offset, expected) in [(page, 2), (window, 0), (2 * window, 2)] {
+            assert_eq!(backing_of(&mem, offset), expected);
+        }
+        assert_eq!(spent.used(), 0);
+    }
+
+    #[test]
+    fn test_file_restore_remaps_small_discards_within_the_budget() {
+        let window = GUEST_MEMORY_ALIGNMENT;
+        let page = host_page_size();
+        let mem = file_restored(3 * window);
+        let region = mem.iter().next().unwrap();
+        let budget = MappingBudget::new(2);
+        assert_eq!(mappings_of(&mem), 1);
+
+        // The first small discard fits the budget and is remapped.
+        region
+            .discard_range_within(MemoryRegionAddress(page as u64), page, &budget)
+            .unwrap();
+        assert_eq!(budget.used(), 2);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(page as u64)).unwrap(), 0);
+        assert_eq!(backing_of(&mem, page), 0);
+        assert_eq!(mappings_of(&mem), 3);
+
+        // The next one does not, and is zeroed in place without adding a mapping.
+        region
+            .discard_range_within(MemoryRegionAddress(3 * page as u64), page, &budget)
+            .unwrap();
+        assert_eq!(budget.used(), 2);
+        assert_eq!(
+            mem.read_obj::<u8>(GuestAddress(3 * page as u64)).unwrap(),
+            0
+        );
+        assert_eq!(backing_of(&mem, 3 * page), 2);
+        assert_eq!(mappings_of(&mem), 3);
+    }
+
+    #[test]
+    fn test_file_restore_frees_remapped_pages_without_a_charge() {
+        let window = GUEST_MEMORY_ALIGNMENT;
+        let page = host_page_size();
+        let mem = file_restored(3 * window);
+        let region = mem.iter().next().unwrap();
+        let budget = MappingBudget::new(4);
+
+        region
+            .discard_range_within(MemoryRegionAddress(page as u64), page, &budget)
+            .unwrap();
+        assert_eq!(budget.used(), 2);
+
+        // The guest uses the remapped page again, then frees it with its file-backed neighbour:
+        // only the neighbour is charged.
+        mem.write_obj(7u8, GuestAddress(page as u64)).unwrap();
+        region
+            .discard_range_within(MemoryRegionAddress(page as u64), 2 * page, &budget)
+            .unwrap();
+        assert_eq!(budget.used(), 4);
+        for offset in [page, 2 * page] {
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(), 0);
+        }
+
+        // Pages that are all anonymous are freed again and again with the budget spent.
+        for _ in 0..3 {
+            mem.write_obj(7u8, GuestAddress(2 * page as u64)).unwrap();
             region
-                .madvise_range(
-                    MemoryRegionAddress(offset as u64),
-                    page,
-                    libc::MADV_DONTNEED,
-                )
+                .discard_range_within(MemoryRegionAddress(page as u64), 2 * page, &budget)
                 .unwrap();
             assert_eq!(
-                mem.read_obj::<u8>(GuestAddress(offset as u64)).unwrap(),
-                expected
+                mem.read_obj::<u8>(GuestAddress(2 * page as u64)).unwrap(),
+                0
             );
         }
+        assert_eq!(budget.used(), 4);
+        for offset in [page, 2 * page] {
+            assert_eq!(backing_of(&mem, offset), 0);
+        }
+        assert_eq!(backing_of(&mem, 3 * page), 2);
+        // What was charged bounds what was added, whatever the kernel merged.
+        assert!(mappings_of(&mem) <= 1 + budget.used());
     }
 
     #[test]
