@@ -37,7 +37,7 @@ pub const SEG_MAX: u32 = 32;
 pub const DEFAULT_BLOCK_NUM_QUEUES: u16 = 1;
 /// How long a block device's rate limiter waits after a bucket runs dry, instead of the
 /// default 100 ms: a throttled request then waits about 10 ms past its tokens, not 100 ms.
-pub const BLOCK_REFILL_TIMER: std::time::Duration = std::time::Duration::from_millis(10);
+pub const BLOCK_REFILL_TIMER: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub const BLOCK_QUEUE_SIZE: u16 = FIRECRACKER_MAX_QUEUE_SIZE;
 // The virtio queue can hold up to 256 descriptors, but 1 request spreads across 2-3 descriptors.
