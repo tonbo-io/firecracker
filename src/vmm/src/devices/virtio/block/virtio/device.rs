@@ -624,8 +624,7 @@ impl VirtioBlock {
             | (1u64 << VIRTIO_RING_F_EVENT_IDX)
             | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
             | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
-            | (1u64 << VIRTIO_BLK_F_MQ)
-            | (1u64 << VIRTIO_BLK_F_SEG_MAX);
+            | (1u64 << VIRTIO_BLK_F_MQ);
 
         if config.cache_type == CacheType::Writeback {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
