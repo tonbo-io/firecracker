@@ -23,6 +23,11 @@ pub enum RateLimiterError {
 // Interval at which the refill timer will run when limiter is at capacity.
 const REFILL_TIMER_DURATION: Duration = Duration::from_millis(100);
 
+// The shortest wait a limiter that re-arms on its tokens ([`RateLimiter::with_refill_timer`])
+// arms after a bucket runs dry, so that a drained bucket wakes its device at most once a
+// millisecond.
+const MIN_REFILL_TIMER_DURATION: Duration = Duration::from_millis(1);
+
 const NANOSEC_IN_ONE_MILLISEC: u64 = 1_000_000;
 
 // Euclid's two-thousand-year-old algorithm for finding the greatest common divisor.
@@ -159,6 +164,14 @@ impl TokenBucket {
             .div_ceil(u128::from(self.processed_capacity));
 
         Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+    }
+
+    /// Returns the time until the bucket holds `tokens`, zero when it already does.
+    fn time_to_tokens(&self, tokens: u64) -> Duration {
+        match tokens.checked_sub(self.budget) {
+            Some(missing) if missing > 0 => self.time_to_refill(missing),
+            _ => Duration::ZERO,
+        }
     }
 
     // Replenishes token bucket based on elapsed time. Should only be called internally by `Self`.
@@ -335,8 +348,13 @@ pub struct RateLimiter {
     timer_fd: TimerFd,
     // Internal flag that quickly determines timer state.
     timer_active: Arc<AtomicBool>,
-    // How long the timer waits after a bucket runs dry before processing resumes.
+    // How long the timer waits after a bucket runs dry before processing resumes, or with
+    // `refill_on_tokens` the longest it waits.
     refill_timer: Duration,
+    // Whether a dry bucket arms the timer for the time until the refused request's tokens are
+    // back (at least `MIN_REFILL_TIMER_DURATION`, at most `refill_timer`) rather than for
+    // `refill_timer` itself.
+    refill_on_tokens: bool,
 }
 
 impl PartialEq for RateLimiter {
@@ -399,12 +417,17 @@ impl RateLimiter {
             timer_fd: TimerFd::new(),
             timer_active: Arc::new(AtomicBool::new(false)),
             refill_timer: REFILL_TIMER_DURATION,
+            refill_on_tokens: false,
         }
     }
 
-    /// Sets how long the timer waits after a bucket runs dry (default 100 ms).
+    /// Re-arms the limiter when a refused request's tokens are back, waiting at least 1 ms and
+    /// at most `refill_timer`, instead of a fixed 100 ms after any bucket runs dry. A request
+    /// held at the bucket's rate then waits about as long as its tokens take, not a whole timer
+    /// period.
     pub fn with_refill_timer(mut self, refill_timer: Duration) -> Self {
         self.refill_timer = refill_timer;
+        self.refill_on_tokens = true;
         self
     }
 
@@ -442,6 +465,7 @@ impl RateLimiter {
             timer_fd: TimerFd::new_mocked(clock),
             timer_active: Arc::new(AtomicBool::new(false)),
             refill_timer: REFILL_TIMER_DURATION,
+            refill_on_tokens: false,
         }
     }
 
@@ -473,8 +497,15 @@ impl RateLimiter {
                 // register a timer to replenish the bucket and resume processing;
                 // make sure there is only one running timer for this limiter.
                 BucketReduction::Failure => {
+                    let wait = if self.refill_on_tokens {
+                        bucket
+                            .time_to_tokens(tokens)
+                            .clamp(MIN_REFILL_TIMER_DURATION, self.refill_timer)
+                    } else {
+                        self.refill_timer
+                    };
                     if !self.is_blocked() {
-                        self.activate_timer(self.refill_timer);
+                        self.activate_timer(wait);
                     }
                     false
                 }
@@ -1082,6 +1113,46 @@ pub(crate) mod tests {
         assert!(!l.is_blocked());
         // try and succeed on another 100 bytes this time
         assert!(l.consume(100, TokenType::Bytes));
+    }
+
+    #[test]
+    fn test_rate_limiter_refill_on_tokens() {
+        // 1000 ops/s, re-armed on the refused request's tokens, at most 10 ms later.
+        let clock = MockClock::new();
+        let cap = Duration::from_millis(10);
+        let mut l = RateLimiter::new_mocked(0, 0, 0, 1000, 0, 1000, &clock).with_refill_timer(cap);
+        assert!(l.consume(1000, TokenType::Ops));
+        // One op is missing: its token is back 1 ms later, and so is the limiter.
+        assert!(!l.consume(1, TokenType::Ops));
+        assert!(l.is_blocked());
+        clock.advance(Duration::from_micros(900));
+        assert!(l.event_handler().is_err());
+        clock.advance(Duration::from_micros(100));
+        l.event_handler().unwrap();
+        assert!(!l.is_blocked());
+        assert!(l.consume(1, TokenType::Ops));
+        // 50 ops are missing, 50 ms of refill: the wait is capped at 10 ms.
+        assert!(!l.consume(50, TokenType::Ops));
+        clock.advance(cap - Duration::from_micros(1));
+        assert!(l.event_handler().is_err());
+        clock.advance(Duration::from_micros(1));
+        l.event_handler().unwrap();
+        assert!(!l.is_blocked());
+    }
+
+    #[test]
+    fn test_rate_limiter_refill_on_tokens_waits_at_least_1ms() {
+        // 1 GB/s: a missing byte is back in a nanosecond, but the limiter waits 1 ms.
+        let clock = MockClock::new();
+        let mut l = RateLimiter::new_mocked(1_000_000_000, 0, 1000, 0, 0, 0, &clock)
+            .with_refill_timer(Duration::from_millis(10));
+        assert!(l.consume(1_000_000_000, TokenType::Bytes));
+        assert!(!l.consume(1, TokenType::Bytes));
+        clock.advance(MIN_REFILL_TIMER_DURATION - Duration::from_nanos(1));
+        assert!(l.event_handler().is_err());
+        clock.advance(Duration::from_nanos(1));
+        l.event_handler().unwrap();
+        assert!(!l.is_blocked());
     }
 
     #[test]

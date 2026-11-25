@@ -88,6 +88,7 @@ impl Persist<'_> for RateLimiter {
             timer_fd: TimerFd::new(),
             timer_active: Arc::new(AtomicBool::new(false)),
             refill_timer: REFILL_TIMER_DURATION,
+            refill_on_tokens: false,
         };
 
         Ok(rate_limiter)
