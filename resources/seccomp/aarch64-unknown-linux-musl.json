@@ -112,11 +112,7 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by the imago VMDK disk image backend, and by the block device's Sync engine to read a request of several data segments"
-            },
-            {
-                "syscall": "pwritev",
-                "comment": "Used by the block device's Sync engine to write a request of several data segments"
+                "comment": "Used by the imago VMDK disk image backend"
             },
             {
                 "syscall": "mremap",
@@ -1659,11 +1655,7 @@
             },
             {
                 "syscall": "preadv",
-                "comment": "Used by imago to read VMDK extents, and by SyncFileEngine to read a request of several data segments"
-            },
-            {
-                "syscall": "pwritev",
-                "comment": "SyncFileEngine writes a request of several data segments"
+                "comment": "Used by imago to read VMDK extents"
             },
             {
                 "syscall": "epoll_ctl"

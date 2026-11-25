@@ -121,8 +121,7 @@ impl Persist<'_> for VirtioBlock {
     ) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
-            .map_err(VirtioBlockError::RateLimiter)?
-            .with_refill_timer(BLOCK_REFILL_TIMER);
+            .map_err(VirtioBlockError::RateLimiter)?;
         let rate_limiter_config: RateLimiterConfig = (&rate_limiter).into();
         let num_queues = state
             .num_queues
@@ -168,7 +167,6 @@ impl Persist<'_> for VirtioBlock {
                     is_read_only,
                     state.file_engine_type.into(),
                     state.disk_image_format,
-                    config.discard,
                 )?,
                 is_io_engine_throttled: false,
             });
@@ -179,9 +177,6 @@ impl Persist<'_> for VirtioBlock {
             blk_size: state.blk_size,
             topology: state.topology,
             discard_sector_alignment: state.discard_sector_alignment,
-            // The features are the saved ones: a device saved before `VIRTIO_BLK_F_SEG_MAX`
-            // existed keeps offering one data segment per request.
-            seg_max: device::seg_max(state.virtio_state.avail_features),
             num_queues: num_queues.to_le(),
             ..Default::default()
         };
@@ -274,7 +269,7 @@ mod tests {
             is_root_device: false,
             partuuid: None,
             is_read_only: false,
-            discard: true,
+            discard: false,
             num_queues: None,
             cache_type: CacheType::Unsafe,
             dmb_size_mib: Some(DmbSizeMib::try_from(32).unwrap()),
@@ -285,10 +280,7 @@ mod tests {
             topology: None,
         };
 
-        let mut block = VirtioBlock::new(config).unwrap();
-        // Model a snapshot taken with a 64 KiB backend. The backing file used to
-        // restore it has no geometry from which the saved alignment could be inferred.
-        block.config_space.discard_sector_alignment = 128;
+        let block = VirtioBlock::new(config).unwrap();
         let guest_mem = default_mem();
 
         // Save the block device.
@@ -311,7 +303,6 @@ mod tests {
         assert!(!block.is_activated());
         assert!(!restored_block.is_activated());
 
-        assert_eq!(restored_block.config_space.discard_sector_alignment, 128);
         assert_eq!(restored_block.dmb_size_mib(), None);
         // Test that block specific fields are the same.
         assert_eq!(
@@ -395,50 +386,5 @@ mod tests {
                 assert_eq!(restored.queue_config(idx), block.queue_config(idx));
             }
         }
-    }
-
-    // A device saved by a build without `VIRTIO_BLK_F_SEG_MAX` is restored without it: it
-    // offers one data segment per request, as its driver expects, and its config space says
-    // so. A device of this build keeps the feature across a save and a restore.
-    #[test]
-    fn test_restore_keeps_saved_segment_limit() {
-        use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_SEG_MAX;
-
-        let f = TempFile::new().unwrap();
-        f.as_file().set_len(0x1000).unwrap();
-        let seg_max_bit = 1u64 << VIRTIO_BLK_F_SEG_MAX;
-        let restore = |state: &VirtioBlockState| {
-            VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, state).unwrap()
-        };
-
-        let mut block = default_block_with_path(
-            f.as_path().to_str().unwrap().to_string(),
-            FileEngineType::Sync,
-        );
-        assert_ne!(block.avail_features() & seg_max_bit, 0);
-        assert_eq!(u32::from_le(block.config_space.seg_max), SEG_MAX);
-        block.acked_features = block.avail_features();
-        let restored = restore(&block.save());
-        assert_ne!(restored.avail_features() & seg_max_bit, 0);
-        assert_ne!(restored.acked_features() & seg_max_bit, 0);
-        assert_eq!(u32::from_le(restored.config_space.seg_max), SEG_MAX);
-
-        let mut old = block.save();
-        old.virtio_state.avail_features &= !seg_max_bit;
-        old.virtio_state.acked_features &= !seg_max_bit;
-        let restored = restore(&old);
-        assert_eq!(restored.avail_features() & seg_max_bit, 0);
-        assert_eq!(restored.acked_features() & seg_max_bit, 0);
-        assert_eq!(restored.config_space.seg_max, 0);
-    }
-
-    // A snapshot of this build is one that a VMM at format 13.0, which takes one data segment
-    // per request, refuses: same major, a minor above its own.
-    #[test]
-    fn test_snapshot_format_refused_before_segments() {
-        use crate::persist::SNAPSHOT_VERSION;
-
-        assert_eq!(SNAPSHOT_VERSION.major(), 13);
-        assert!(SNAPSHOT_VERSION.minor() > 0);
     }
 }

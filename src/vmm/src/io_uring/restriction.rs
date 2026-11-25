@@ -22,8 +22,6 @@ use crate::io_uring::operation::OpCode;
 pub enum Restriction {
     /// Allow an operation.
     AllowOpCode(OpCode),
-    /// Allow operations to be forced into the kernel's async worker pool (`IOSQE_ASYNC`).
-    AllowAsync,
     /// Only allow operations on pre-registered fds.
     RequireFixedFds,
 }
@@ -42,13 +40,6 @@ impl From<&Restriction> for io_uring_restriction {
                         .unwrap();
                 instance.__bindgen_anon_1.sqe_op = *opcode as u8;
             }
-            AllowAsync => {
-                instance.opcode = u16::try_from(
-                    io_uring_register_restriction_op::IORING_RESTRICTION_SQE_FLAGS_ALLOWED,
-                )
-                .unwrap();
-                instance.__bindgen_anon_1.sqe_flags = 1 << io_uring_sqe_flags_bit::IOSQE_ASYNC_BIT;
-            }
             RequireFixedFds => {
                 instance.opcode = u16::try_from(
                     io_uring_register_restriction_op::IORING_RESTRICTION_SQE_FLAGS_REQUIRED,
@@ -60,25 +51,5 @@ impl From<&Restriction> for io_uring_restriction {
         };
 
         instance
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::undocumented_unsafe_blocks)]
-    use super::*;
-
-    #[test]
-    fn test_allow_async() {
-        let restriction = io_uring_restriction::from(&Restriction::AllowAsync);
-
-        assert_eq!(
-            u32::from(restriction.opcode),
-            io_uring_register_restriction_op::IORING_RESTRICTION_SQE_FLAGS_ALLOWED
-        );
-        assert_eq!(
-            unsafe { restriction.__bindgen_anon_1.sqe_flags },
-            1 << io_uring_sqe_flags_bit::IOSQE_ASYNC_BIT
-        );
     }
 }

@@ -335,8 +335,6 @@ pub struct RateLimiter {
     timer_fd: TimerFd,
     // Internal flag that quickly determines timer state.
     timer_active: Arc<AtomicBool>,
-    // How long the timer waits after a bucket runs dry before processing resumes.
-    refill_timer: Duration,
 }
 
 impl PartialEq for RateLimiter {
@@ -398,14 +396,7 @@ impl RateLimiter {
             ops: ops_token_bucket,
             timer_fd: TimerFd::new(),
             timer_active: Arc::new(AtomicBool::new(false)),
-            refill_timer: REFILL_TIMER_DURATION,
         }
-    }
-
-    /// Sets how long the timer waits after a bucket runs dry (default 100 ms).
-    pub fn with_refill_timer(mut self, refill_timer: Duration) -> Self {
-        self.refill_timer = refill_timer;
-        self
     }
 
     /// Test-only: like [`RateLimiter::new`], but the buckets and timer are driven by the given
@@ -441,7 +432,6 @@ impl RateLimiter {
             ops: ops_token_bucket,
             timer_fd: TimerFd::new_mocked(clock),
             timer_active: Arc::new(AtomicBool::new(false)),
-            refill_timer: REFILL_TIMER_DURATION,
         }
     }
 
@@ -474,7 +464,7 @@ impl RateLimiter {
                 // make sure there is only one running timer for this limiter.
                 BucketReduction::Failure => {
                     if !self.is_blocked() {
-                        self.activate_timer(self.refill_timer);
+                        self.activate_timer(REFILL_TIMER_DURATION);
                     }
                     false
                 }

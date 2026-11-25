@@ -170,11 +170,6 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-///
-/// 13.1 is 13.0 with one more meaning and the same layout: a virtio block device may have
-/// offered `VIRTIO_BLK_F_SEG_MAX`, and its driver may send requests of several data segments.
-/// A VMM that reads only 13.0 takes exactly one data descriptor per request and would mishandle
-/// such a driver after a restore, so it must refuse these snapshots; the minor says so.
 pub const SNAPSHOT_VERSION: Version = Version::new(13, 1, 0);
 
 /// Creates a Microvm snapshot.

@@ -11,7 +11,6 @@ use vm_memory::{
     WriteVolatile,
 };
 
-use super::{DataSegment, MAX_IOVECS, advance_iovecs, mark_dirty_range, segment_iovecs};
 use crate::vstate::memory::{Bitmap, GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -26,8 +25,6 @@ pub enum SyncIoError {
     SyncAll(std::io::Error),
     /// Transfer: {0}
     Transfer(GuestMemoryError),
-    /// Vectored transfer after {1} bytes: {0}
-    Vectored(std::io::Error, u32),
 }
 
 #[derive(Debug)]
@@ -161,106 +158,6 @@ impl SyncFileEngine {
             .and_then(|slice| Ok(self.file.write_all_volatile(&slice)?))
             .map_err(SyncIoError::Transfer)?;
         Ok(count)
-    }
-
-    /// Reads at `offset` into `segments`, in order, with one `preadv` unless it comes back
-    /// short. Marks dirty exactly the bytes read, also when it fails.
-    pub fn readv(
-        &mut self,
-        offset: u64,
-        mem: &GuestMemoryMmap,
-        segments: &[DataSegment],
-    ) -> Result<u32, SyncIoError> {
-        // Every segment is resolved before the first byte is read.
-        let mut iovecs = segment_iovecs(mem, segments).map_err(SyncIoError::Transfer)?;
-        let (done, result) = self.transfer_vectored(&mut iovecs, offset, false);
-        // A failed `preadv` writes nothing, so what the earlier ones read is all there is to
-        // mark, as for a single segment.
-        mark_dirty_range(mem, segments, 0, done);
-        match result {
-            Ok(()) => Ok(done),
-            Err(err) => Err(SyncIoError::Vectored(err, done)),
-        }
-    }
-
-    /// Writes `segments`, in order, at `offset`, with one `pwritev` unless it comes back short.
-    pub fn writev(
-        &mut self,
-        offset: u64,
-        mem: &GuestMemoryMmap,
-        segments: &[DataSegment],
-    ) -> Result<u32, SyncIoError> {
-        // Every segment is resolved before the first byte is written.
-        let mut iovecs = segment_iovecs(mem, segments).map_err(SyncIoError::Transfer)?;
-        let (done, result) = self.transfer_vectored(&mut iovecs, offset, true);
-        match result {
-            Ok(()) => Ok(done),
-            Err(err) => Err(SyncIoError::Vectored(err, done)),
-        }
-    }
-
-    /// Transfers `iovecs` at `offset` until nothing is left of them, going on after a short
-    /// transfer from where it stopped. Returns the bytes transferred, and the error that stopped
-    /// it if one did: no progress (the end of the file) is one.
-    fn transfer_vectored(
-        &self,
-        iovecs: &mut Vec<libc::iovec>,
-        offset: u64,
-        write: bool,
-    ) -> (u32, Result<(), std::io::Error>) {
-        let fd = self.file.as_raw_fd();
-        let mut done: u32 = 0;
-        while !iovecs.is_empty() {
-            let position = offset
-                .checked_add(u64::from(done))
-                .and_then(|position| libc::off_t::try_from(position).ok());
-            let Some(position) = position else {
-                return (
-                    done,
-                    Err(std::io::Error::from_raw_os_error(libc::EOVERFLOW)),
-                );
-            };
-            let count = libc::c_int::try_from(iovecs.len().min(MAX_IOVECS))
-                .expect("MAX_IOVECS fits a c_int");
-            // SAFETY: `fd` is the engine's open file, and `iovecs` holds `count` or more ranges
-            // that `segment_iovecs` checked to be guest memory, which the device keeps mapped
-            // for the duration of this call.
-            let ret = unsafe {
-                if write {
-                    libc::pwritev(fd, iovecs.as_ptr(), count, position)
-                } else {
-                    libc::preadv(fd, iovecs.as_ptr(), count, position)
-                }
-            };
-            let moved = match usize::try_from(ret) {
-                Ok(moved) => moved,
-                Err(_) => {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return (done, Err(err));
-                }
-            };
-            if moved == 0 {
-                let kind = if write {
-                    ErrorKind::WriteZero
-                } else {
-                    ErrorKind::UnexpectedEof
-                };
-                return (
-                    done,
-                    Err(std::io::Error::new(
-                        kind,
-                        "vectored transfer made no progress",
-                    )),
-                );
-            }
-            // The callers bound a request by `MAX_VECTORED_BYTES`.
-            done = done.saturating_add(u32::try_from(moved).unwrap_or(u32::MAX));
-            advance_iovecs(iovecs, moved);
-        }
-        (done, Ok(()))
     }
 
     pub fn flush(&mut self) -> Result<(), SyncIoError> {

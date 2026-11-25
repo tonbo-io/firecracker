@@ -50,37 +50,11 @@ In order, on top of `upstream-main`:
 5. **Discard remaps after a file-backed restore are bounded to whole 2 MiB
    windows.** The edge pages of a discard are zeroed in place, so the number
    of mapping splits is bounded by the guest memory size. No upstream issue
-   yet. No other patch touches the code it changes, so it can be dropped
-   without touching the others.
+   yet. It is last so that it can be dropped without touching the others.
 
-6. **Several data segments per virtio-blk request** (`VIRTIO_BLK_F_SEG_MAX`
-   with `seg_max` 32, on both engines), upstream issue
-   [#6441](https://github.com/firecracker-microvm/firecracker/issues/6441).
-   A series: the request parser and its tests are ported from a community
-   commit under its author's name, the engines, the device and the hostile
-   chain tests are ours. It raises the snapshot format to 13.1.0.
-
-## Known base behaviours, not patched
-
-These are upstream's behaviours that the stack leaves as they are. They are
-listed so that nobody takes them for effects of a patch.
-
-- A virtio-blk request that the io_uring ring has no room for is put back on
-  the queue after the rate limiter was charged for it, and is charged again
-  when it is taken up later. The Sync engine never puts a request back.
-- A request larger than a rate limiter bucket empties it and waits for the
-  time its excess takes to refill, but `TokenBucket::reduce` does not move
-  the bucket's last-update time past that debt, so the next refill credits
-  the waited time again. Requests of between one and two bucket sizes can
-  therefore average up to twice the configured rate.
-- A request of several data segments may carry up to about 2 GiB, which the
-  Sync engine moves in one blocking `preadv` or `pwritev`: on the VMM thread
-  for a device without worker threads. A guest does this to itself, and the
-  size is not capped below what one call moves.
-- The device does not hold a driver to the `seg_max` it advertises: a chain
-  of more data descriptors is served as long as the queue holds it. This one
-  is deliberate, and the same as for other limits a driver reads from the
-  config space.
+Not in the stack yet: several data segments per virtio-blk request
+(`VIRTIO_BLK_F_SEG_MAX`), upstream issue
+[#6441](https://github.com/firecracker-microvm/firecracker/issues/6441).
 
 ## Checks
 

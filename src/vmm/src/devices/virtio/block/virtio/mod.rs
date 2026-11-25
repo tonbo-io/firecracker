@@ -28,16 +28,8 @@ pub const SECTOR_SIZE: u32 = (0x01_u32) << SECTOR_SHIFT;
 /// Keep this bounded so guest fstrim is split into predictable chunks instead
 /// of letting one large discard ioctl block the VMM thread for too long.
 pub const MAX_DISCARD_SECTORS: u32 = (128_u32 << 20) / SECTOR_SIZE;
-/// Data segments per request the device advertises (`VIRTIO_BLK_F_SEG_MAX`), so that a driver
-/// sends a buffer of scattered pages as one request rather than one request per page. With the
-/// header and the status, such a request takes 34 of a queue's 256 descriptors. The parser
-/// does not enforce it: a chain is bounded by the queue size and by its total length.
-pub const SEG_MAX: u32 = 32;
 /// The number of queues of block device.
 pub const DEFAULT_BLOCK_NUM_QUEUES: u16 = 1;
-/// How long a block device's rate limiter waits after a bucket runs dry, instead of the
-/// default 100 ms: a throttled request then waits about 10 ms past its tokens, not 100 ms.
-pub const BLOCK_REFILL_TIMER: std::time::Duration = std::time::Duration::from_millis(10);
 
 pub const BLOCK_QUEUE_SIZE: u16 = FIRECRACKER_MAX_QUEUE_SIZE;
 // The virtio queue can hold up to 256 descriptors, but 1 request spreads across 2-3 descriptors.
@@ -62,6 +54,8 @@ pub enum VirtioBlockError {
     InvalidDataLength,
     /// The requested operation would cause a seek beyond disk end.
     InvalidOffset,
+    /// Discard is not supported with the async IO engine.
+    DiscardAsyncUnsupported,
     /// Discard is not supported with read-only drives.
     DiscardReadOnlyUnsupported,
     /// Guest gave us a read only descriptor that protocol says to write to.
